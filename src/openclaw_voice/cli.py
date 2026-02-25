@@ -567,6 +567,7 @@ def discord_bot_cmd(
         default_timezone=cfg_file.get("default_timezone", "UTC"),
         extra_context=cfg_file.get("extra_context", ""),
         whisper_prompt=cfg_file.get("whisper_prompt", ""),
+        corrections_file=cfg_file.get("corrections_file", ""),
     )
 
     # Resolve VAD and transcript settings (CLI > env > config file > defaults)

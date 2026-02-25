@@ -27,6 +27,7 @@ Usage via CLI::
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
 import logging
 import tempfile
@@ -93,6 +94,11 @@ class VoiceSink(Sink):  # type: ignore[misc]
         bot_user_id:     Bot's own user ID (audio from self is ignored).
     """
 
+    # Default pre-buffer: 300ms of audio at 20ms/frame = 15 frames
+    DEFAULT_PRE_BUFFER_MS = 300
+    # Discord sends ~20ms frames
+    _FRAME_DURATION_MS = 20
+
     def __init__(
         self,
         stt_queue: asyncio.Queue,  # type: ignore[type-arg]
@@ -101,6 +107,7 @@ class VoiceSink(Sink):  # type: ignore[misc]
         vad_silence_ms: int = DEFAULT_VAD_SILENCE_MS,
         vad_min_speech_ms: int = DEFAULT_VAD_MIN_SPEECH_MS,
         bot_user_id: int = 0,
+        pre_buffer_ms: int = DEFAULT_PRE_BUFFER_MS,
         *args,
         **kwargs,
     ) -> None:
@@ -111,6 +118,10 @@ class VoiceSink(Sink):  # type: ignore[misc]
         self._vad_silence_ms = vad_silence_ms
         self._vad_min_speech_ms = vad_min_speech_ms
         self._bot_user_id = bot_user_id
+        # Pre-buffer config
+        self._pre_buffer_frames = max(1, pre_buffer_ms // self._FRAME_DURATION_MS)
+        # Per-user rolling pre-buffer of resampled 16kHz mono PCM chunks
+        self._pre_buffers: dict[int, collections.deque[bytes]] = {}
         # Per-user accumulated PCM audio (16kHz mono)
         self._user_audio: dict[int, bytearray] = {}
         # Per-user raw frame buffers (to handle partial frames from resampling)
@@ -155,10 +166,25 @@ class VoiceSink(Sink):  # type: ignore[misc]
 
         self._buffers[user] = b""
 
+        # Feed the rolling pre-buffer (always, even during active speech)
+        if user not in self._pre_buffers:
+            self._pre_buffers[user] = collections.deque(maxlen=self._pre_buffer_frames)
+        self._pre_buffers[user].append(mono_pcm)
+
         # Append to per-user audio accumulator
         if user not in self._user_audio:
+            # Speech just started — prepend pre-buffer to capture lead-in audio
             self._user_audio[user] = bytearray()
-            log.debug("Speech started for user %s", user)
+            pre_buf = self._pre_buffers.get(user)
+            if pre_buf and len(pre_buf) > 1:
+                # All frames except the last (which is the current chunk)
+                for chunk in list(pre_buf)[:-1]:
+                    self._user_audio[user].extend(chunk)
+            log.debug(
+                "Speech started for user %s (pre-buffered %d frames)",
+                user,
+                len(pre_buf) - 1 if pre_buf and len(pre_buf) > 1 else 0,
+            )
         self._user_audio[user].extend(mono_pcm)
 
         # Reset the debounce timer. write() is called from pycord's audio
@@ -232,6 +258,7 @@ class VoiceSink(Sink):  # type: ignore[misc]
         self._flush_timers.clear()
         self._user_audio.clear()
         self._buffers.clear()
+        self._pre_buffers.clear()
         self._user_seqs.clear()
         self._vad_instances.clear()
         log.debug("VoiceSink cleaned up")

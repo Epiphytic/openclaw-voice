@@ -37,6 +37,9 @@ htmlcov/
 config.local.toml
 *.local.toml
 
+# Word corrections (user-specific)
+corrections.toml
+
 # Speaker profiles (user data, not committed)
 profiles/
 speaker-profiles/

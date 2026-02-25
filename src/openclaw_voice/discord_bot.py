@@ -1169,6 +1169,13 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
                 timeout=ESCALATION_MAX_WAIT_S,
             )
 
+            # Filter non-answers (NO_REPLY, bare "NO", etc.)
+            if bel_response:
+                stripped = bel_response.strip().upper()
+                if stripped in ("NO_REPLY", "NO", "NOREPLY", "N/A", ""):
+                    log.warning("Escalation returned non-answer: %r — treating as empty", bel_response)
+                    bel_response = None
+
             if not bel_response:
                 fail_text = f"Sorry, I couldn't reach {agent_name}."
                 audio = await loop.run_in_executor(

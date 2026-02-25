@@ -343,8 +343,69 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
     async def on_ready(self) -> None:
         # Kill any previous instance and write our PID
         self._claim_pid_file()
+        # Build cast of characters for all guilds
+        await self._build_cast()
         log.info("VoiceBot ready", extra={"user": str(self.user)})
         await self._restore_voice_state()
+
+    # ------------------------------------------------------------------
+    # Cast of characters — built on startup for fast message handling
+    # ------------------------------------------------------------------
+
+    # Roles for on_message routing:
+    #   "self"   — this bot (Chip), skip entirely
+    #   "agent"  — main agent bot (belthanior/Bel), skip in bridge (handled by escalation TTS)
+    #   "bot"    — other bots, identify by name in TTS bridge
+    #   "user"   — human users, skip if in voice channel, otherwise identify
+    _cast: dict[int, dict] = {}  # user_id → {"name": str, "role": str}
+
+    async def _build_cast(self) -> None:
+        """Build a lookup of all members and bots across guilds."""
+        main_name = self._pipeline_config.main_agent_name.lower()
+        self_id = self.user.id
+
+        for guild in self.guilds:
+            # Fetch full member list (works even without members intent for small guilds)
+            try:
+                members = guild.members
+                if not members or len(members) < 2:
+                    # Cache might be empty — try fetching
+                    members = []
+                    async for member in guild.fetch_members(limit=200):
+                        members.append(member)
+            except Exception as exc:
+                log.warning("Failed to fetch members for guild %s: %s", guild.id, exc)
+                members = guild.members or []
+
+            for member in members:
+                if member.id == self_id:
+                    role = "self"
+                elif member.bot:
+                    name_lower = (member.display_name or member.name).lower()
+                    if name_lower in (main_name, "belthanior", "bel"):
+                        role = "agent"
+                    else:
+                        role = "bot"
+                else:
+                    role = "user"
+
+                self._cast[member.id] = {
+                    "name": member.display_name or member.name,
+                    "role": role,
+                }
+
+            log.info(
+                "Cast of characters for guild %s: %d members (%d users, %d bots, agent=%s)",
+                guild.name,
+                len(members),
+                sum(1 for v in self._cast.values() if v["role"] == "user"),
+                sum(1 for v in self._cast.values() if v["role"] in ("bot", "agent", "self")),
+                next((v["name"] for v in self._cast.values() if v["role"] == "agent"), "none"),
+            )
+
+    def _cast_lookup(self, user_id: int) -> dict:
+        """Look up a user in the cast. Returns {"name": str, "role": str}."""
+        return self._cast.get(user_id, {"name": str(user_id), "role": "unknown"})
 
     @staticmethod
     def _claim_pid_file() -> None:
@@ -427,20 +488,15 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
                         )
 
     async def on_message(self, message: discord.Message) -> None:
-        """Bridge text channel messages to voice TTS.
+        """Bridge text channel messages to voice TTS using the cast of characters.
 
-        When someone posts in the linked text channel while a voice session is
-        active, synthesise the message and queue it for playback — so voice
-        participants hear what's typed in the text channel.
-
-        Conditions to read aloud:
-          - Active voice session in the guild
-          - Message is in the linked text channel (where /join was invoked)
-          - Author is not a bot (any bot, including Chip itself)
-          - Message has non-empty text content
-          - tts_read_channel is enabled in pipeline config
+        Routing by role:
+          "self"    → skip (Chip's own messages)
+          "agent"   → skip (Bel's posts — already handled by escalation TTS)
+          "user"    → skip if in voice channel, otherwise read aloud with attribution
+          "bot"     → read aloud with attribution
+          "unknown" → read aloud with attribution (new member not in startup cast)
         """
-        # Must be a guild message
         if not message.guild:
             return
 
@@ -454,44 +510,52 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
         if not text_channel_id or message.channel.id != text_channel_id:
             return
 
-        # Skip Chip's own messages
-        if message.author.id == self.user.id:
+        # Look up in cast
+        cast_entry = self._cast_lookup(message.author.id)
+        role = cast_entry["role"]
+        display_name = cast_entry["name"]
+
+        # If not in cast yet (joined after startup), add them now
+        if role == "unknown":
+            display_name = message.author.display_name or message.author.name
+            if message.author.bot:
+                # Check if this is the main agent
+                name_lower = display_name.lower()
+                main_name = self._pipeline_config.main_agent_name.lower()
+                if name_lower in (main_name, "belthanior", "bel"):
+                    role = "agent"
+                else:
+                    role = "bot"
+            else:
+                role = "user"
+            self._cast[message.author.id] = {"name": display_name, "role": role}
+            log.info("Added to cast: %s (id=%d, role=%s)", display_name, message.author.id, role)
+
+        # Route by role
+        if role == "self":
+            return
+        if role == "agent":
+            log.debug("on_message: skipping agent message from %s", display_name)
             return
 
-        # Skip messages from the main agent bot (belthanior) — escalation
-        # responses already come through the TTS pipeline directly.
-        # The channel posts are just text records for non-voice participants.
-        if message.author.bot:
-            author_lower = (message.author.display_name or message.author.name or "").lower()
-            main_name = self._pipeline_config.main_agent_name.lower()
-            if author_lower in (main_name, "belthanior", "bel"):
-                log.debug("on_message: skipping main agent bot message from %s", author_lower)
-                return
-
-        # Skip messages from users currently in the voice channel — they can hear themselves
-        if not message.author.bot:
+        # Users in voice can hear themselves type — skip
+        if role == "user":
             vc = message.guild.voice_client if message.guild else None
             if vc and vc.channel:
                 voice_member_ids = {m.id for m in vc.channel.members}
                 if message.author.id in voice_member_ids:
-                    log.debug("on_message: skipping — author %s is in voice channel", message.author.display_name)
+                    log.debug("on_message: skipping — %s is in voice channel", display_name)
                     return
-                else:
-                    log.debug("on_message: author %s NOT in voice (%s)", message.author.id, voice_member_ids)
 
         content = message.content.strip()
         if not content:
             return
 
         pipeline = self._pipelines.get(guild_id)
-        if pipeline is None:
-            return
-
-        if not pipeline.config.tts_read_channel:
+        if pipeline is None or not pipeline.config.tts_read_channel:
             return
 
         loop = asyncio.get_event_loop()
-        display_name = message.author.display_name
         word_count = len(content.split())
 
         # Summarize long messages via LLM so TTS stays concise
@@ -513,18 +577,17 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
                 if summary and isinstance(summary, str):
                     content = summary.strip()
                 else:
-                    # Fallback: truncate to first 250 words
                     content = " ".join(content.split()[:250]) + "…"
             except Exception as exc:
                 log.warning("Failed to summarize channel message: %s", exc)
                 content = " ".join(content.split()[:250]) + "…"
 
-        # Attribute the speaker (main agent bot is already filtered above)
+        # Attribution: other speakers get identified, self/agent never reach here
         tts_text = f"{display_name} says: {content}"
 
         log.info(
-            "Text-to-voice bridge: reading channel message",
-            extra={"guild_id": guild_id, "author": display_name, "words": word_count},
+            "Text-to-voice bridge: reading message",
+            extra={"guild_id": guild_id, "author": display_name, "role": role, "words": word_count},
         )
 
         audio = await loop.run_in_executor(
@@ -796,7 +859,14 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
                     extra={"guild_id": guild_id, "user_id": user_id, "seq": seq},
                 )
 
-                display_name = await self._resolve_display_name_async(guild_id, user_id)
+                # Use cast first, fall back to async resolution
+                cast_entry = self._cast_lookup(int(user_id))
+                if cast_entry["role"] != "unknown":
+                    display_name = cast_entry["name"]
+                else:
+                    display_name = await self._resolve_display_name_async(guild_id, user_id)
+                    # Cache in cast for next time
+                    self._cast[int(user_id)] = {"name": display_name, "role": "user"}
 
                 # Transcribe in executor (blocking Whisper HTTP call)
                 transcript = await loop.run_in_executor(

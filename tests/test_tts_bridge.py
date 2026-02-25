@@ -82,7 +82,7 @@ class TestKokoroEventHandlerDescribe:
 
     @pytest.mark.asyncio
     async def test_describe_returns_info(self):
-        from unittest.mock import AsyncMock, MagicMock
+        from unittest.mock import AsyncMock
 
         from wyoming.info import Describe
 
@@ -95,7 +95,7 @@ class TestKokoroEventHandlerDescribe:
         written_events = []
         handler.write_event = AsyncMock(side_effect=lambda e: written_events.append(e))
 
-        describe_event = Describe().event()
+        Describe().event()
         await handler._handle_describe()
 
         assert len(written_events) == 1
@@ -114,8 +114,9 @@ class TestKokoroEventHandlerSynthesize:
     async def test_synthesize_empty_text_sends_stop(self):
         from unittest.mock import AsyncMock
 
-        from openclaw_voice.tts_bridge import KokoroEventHandler
         from wyoming.tts import Synthesize
+
+        from openclaw_voice.tts_bridge import KokoroEventHandler
 
         config = TTSConfig(kokoro_url="http://mock-kokoro/v1/audio/speech")
         handler = KokoroEventHandler.__new__(KokoroEventHandler)
@@ -136,9 +137,10 @@ class TestKokoroEventHandlerSynthesize:
         """Mock Kokoro to return WAV bytes and verify AudioChunk events are sent."""
         from unittest.mock import AsyncMock, MagicMock, patch
 
-        from openclaw_voice.tts_bridge import KokoroEventHandler, AUDIO_CHUNK_SIZE
-        from wyoming.audio import AudioChunk, AudioStop, AudioStart
+        from wyoming.audio import AudioChunk, AudioStart, AudioStop
         from wyoming.tts import Synthesize
+
+        from openclaw_voice.tts_bridge import AUDIO_CHUNK_SIZE, KokoroEventHandler
 
         config = TTSConfig(kokoro_url="http://mock-kokoro/v1/audio/speech")
         handler = KokoroEventHandler.__new__(KokoroEventHandler)

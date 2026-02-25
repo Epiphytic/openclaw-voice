@@ -8,8 +8,6 @@ import wave
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from openclaw_voice.stt_bridge import STTConfig, WhisperEventHandler
 
 

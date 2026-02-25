@@ -25,17 +25,14 @@ Usage via CLI::
 from __future__ import annotations
 
 import asyncio
-import io
+import contextlib
 import logging
-import os
-import queue
-import subprocess
 import tempfile
-import threading
 import time
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+
+from openclaw_voice.vad import FRAME_SIZE, VoiceActivityDetector
+from openclaw_voice.voice_pipeline import PipelineConfig, VoicePipeline
 
 log = logging.getLogger("openclaw_voice.discord_bot")
 
@@ -50,9 +47,6 @@ except ImportError:
     _PYCORD_AVAILABLE = False
     discord = None  # type: ignore[assignment]
     Sink = object   # type: ignore[assignment,misc]
-
-from openclaw_voice.vad import FRAME_SIZE, FRAME_DURATION_MS, VoiceActivityDetector
-from openclaw_voice.voice_pipeline import PipelineConfig, VoicePipeline
 
 # Sample rates
 DISCORD_SAMPLE_RATE = 48_000   # Discord sends 48kHz stereo opus/PCM
@@ -371,10 +365,8 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
             task = tasks.pop(guild_id, None)
             if task and not task.done():
                 task.cancel()
-                try:
+                with contextlib.suppress(asyncio.CancelledError):
                     await task
-                except asyncio.CancelledError:
-                    pass
 
         # Clean up pipelines and queues
         self._pipelines.pop(guild_id, None)
@@ -691,7 +683,7 @@ def create_bot(
     transcript_channel_id: int | None = None,
     vad_silence_ms: int = DEFAULT_VAD_SILENCE_MS,
     vad_min_speech_ms: int = DEFAULT_VAD_MIN_SPEECH_MS,
-) -> "VoiceBot":
+) -> VoiceBot:
     """Create a configured VoiceBot instance.
 
     Args:

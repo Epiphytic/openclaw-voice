@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import io
-import json
 import wave
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -19,7 +18,6 @@ from openclaw_voice.speaker_id import (
     load_profiles,
     save_profile,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -102,7 +100,7 @@ class TestAudioToArray:
         assert len(arr) == 8000
 
     def test_invalid_bytes_raises(self):
-        with pytest.raises(Exception):
+        with pytest.raises((ValueError, RuntimeError)):
             audio_to_array(b"not audio data at all")
 
 

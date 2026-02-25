@@ -340,14 +340,14 @@ def all_cmd(
     """Start STT bridge, TTS bridge, and Speaker ID server concurrently."""
     _setup_logging(log_level)
 
-    cfg_file: dict = {}
     if config:
-        cfg_file = _load_toml_config(Path(config))
+        _load_toml_config(Path(config))
 
+    import threading
+
+    from openclaw_voice.speaker_id import SpeakerIDConfig, run_speaker_id
     from openclaw_voice.stt_bridge import STTConfig, run_stt_bridge
     from openclaw_voice.tts_bridge import TTSConfig, run_tts_bridge
-    from openclaw_voice.speaker_id import SpeakerIDConfig, run_speaker_id
-    import threading
 
     stt_cfg = STTConfig(
         port=stt_port,
@@ -507,8 +507,8 @@ def discord_bot_cmd(
         resolved_guild_ids = [int(raw)] if isinstance(raw, (str, int)) else [int(g) for g in raw]
 
     from openclaw_voice.discord_bot import (
-        DEFAULT_VAD_SILENCE_MS,
         DEFAULT_VAD_MIN_SPEECH_MS,
+        DEFAULT_VAD_SILENCE_MS,
         PipelineConfig,
         create_bot,
     )

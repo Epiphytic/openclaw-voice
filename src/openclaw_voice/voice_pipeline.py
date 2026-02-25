@@ -25,11 +25,10 @@ from __future__ import annotations
 
 import io
 import logging
-import struct
 import time
 import wave
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import httpx
 

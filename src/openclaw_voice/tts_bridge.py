@@ -27,21 +27,19 @@ Usage:
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from dataclasses import dataclass, field
 from functools import partial
 from typing import Any
 
 import httpx
-
-from openclaw_voice.facades.kokoro import KokoroFacade
-
 from wyoming.audio import AudioChunk, AudioStart, AudioStop
 from wyoming.event import Event
 from wyoming.info import Attribution, Describe, Info, TtsProgram, TtsVoice
 from wyoming.server import AsyncEventHandler, AsyncServer
 from wyoming.tts import Synthesize
+
+from openclaw_voice.facades.kokoro import KokoroFacade
 
 log = logging.getLogger("openclaw_voice.tts")
 

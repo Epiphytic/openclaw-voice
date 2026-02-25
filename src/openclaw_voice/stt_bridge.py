@@ -40,14 +40,13 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-
-from openclaw_voice.facades.whisper import WhisperFacade
-
 from wyoming.asr import Transcribe, Transcript
 from wyoming.audio import AudioChunk, AudioStop
 from wyoming.event import Event
 from wyoming.info import AsrModel, AsrProgram, Attribution, Describe, Info
 from wyoming.server import AsyncEventHandler, AsyncServer
+
+from openclaw_voice.facades.whisper import WhisperFacade
 
 log = logging.getLogger("openclaw_voice.stt")
 

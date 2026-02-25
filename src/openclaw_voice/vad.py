@@ -18,7 +18,6 @@ Usage::
 from __future__ import annotations
 
 import logging
-from collections import deque
 
 import webrtcvad  # type: ignore[import]
 

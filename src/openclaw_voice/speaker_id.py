@@ -119,10 +119,10 @@ def audio_to_array(content: bytes) -> np.ndarray:
             buf.seek(0)
             audio, sr = librosa.load(buf, sr=TARGET_SAMPLE_RATE, mono=True)
             return audio.astype(np.float32)
-        except ImportError:
+        except ImportError as exc:
             raise ValueError(
                 "Could not decode audio — install 'librosa' for broader format support"
-            )
+            ) from exc
 
     # Mono conversion
     if audio.ndim > 1:
@@ -134,11 +134,11 @@ def audio_to_array(content: bytes) -> np.ndarray:
             import librosa  # type: ignore[import]
 
             audio = librosa.resample(audio, orig_sr=sr, target_sr=TARGET_SAMPLE_RATE)
-        except ImportError:
+        except ImportError as exc:
             raise ValueError(
                 f"Audio sample rate is {sr} Hz but {TARGET_SAMPLE_RATE} Hz required — "
                 "install 'librosa' to enable automatic resampling"
-            )
+            ) from exc
 
     return audio.astype(np.float32)
 
@@ -175,7 +175,7 @@ def create_app(config: SpeakerIDConfig) -> FastAPI:
 
     @app.post("/identify")
     async def identify(
-        file: UploadFile = File(...),
+        file: UploadFile = File(...),  # noqa: B008
         threshold: float = Form(config.default_threshold),
     ) -> JSONResponse:
         """Identify the speaker in an audio file.
@@ -252,7 +252,7 @@ def create_app(config: SpeakerIDConfig) -> FastAPI:
     async def enroll(
         name: str = Form(...),
         access_level: str = Form("standard"),
-        file: UploadFile = File(...),
+        file: UploadFile = File(...),  # noqa: B008
     ) -> JSONResponse:
         """Enroll or update a speaker.
 

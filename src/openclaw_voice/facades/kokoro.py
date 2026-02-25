@@ -109,8 +109,10 @@ class KokoroFacade:
             },
         )
 
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            async with client.stream("POST", self._url, json=payload) as resp:
-                resp.raise_for_status()
-                async for chunk in resp.aiter_bytes(chunk_size=chunk_size):
-                    yield chunk
+        async with (
+            httpx.AsyncClient(timeout=self._timeout) as client,
+            client.stream("POST", self._url, json=payload) as resp,
+        ):
+            resp.raise_for_status()
+            async for chunk in resp.aiter_bytes(chunk_size=chunk_size):
+                yield chunk

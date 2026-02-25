@@ -9,10 +9,8 @@ import pytest
 from openclaw_voice.vad import (
     FRAME_DURATION_MS,
     FRAME_SIZE,
-    SAMPLE_RATE,
     VoiceActivityDetector,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers

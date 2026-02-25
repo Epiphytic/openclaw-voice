@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import io
 import wave
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -13,7 +13,6 @@ from openclaw_voice.voice_pipeline import (
     VoicePipeline,
     _pcm_to_wav,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers

@@ -1,0 +1,86 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "openclaw-voice"
+version = "0.1.0"
+description = "Wyoming protocol bridges for Home Assistant voice — STT (whisper.cpp), TTS (Kokoro), speaker ID (Resemblyzer)"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+authors = [
+    { name = "Epiphytic", url = "https://github.com/epiphytic" },
+]
+keywords = ["wyoming", "home-assistant", "voice", "stt", "tts", "whisper", "kokoro"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Home Automation",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+]
+dependencies = [
+    "wyoming>=1.5",
+    "fastapi>=0.100",
+    "uvicorn[standard]>=0.23",
+    "numpy>=1.24",
+    "soundfile>=0.12",
+    "httpx>=0.25",
+    "click>=8.1",
+    "tomli>=2.0; python_version < '3.11'",
+]
+
+[project.optional-dependencies]
+speaker-id = [
+    "resemblyzer>=0.1.3",
+]
+dev = [
+    "pytest>=7.4",
+    "pytest-asyncio>=0.21",
+    "pytest-mock>=3.12",
+    "ruff>=0.1",
+    "mypy>=1.5",
+    "respx>=0.20",
+]
+all = [
+    "openclaw-voice[speaker-id,dev]",
+]
+
+[project.scripts]
+openclaw-voice = "openclaw_voice.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/epiphytic/openclaw-voice"
+Repository = "https://github.com/epiphytic/openclaw-voice"
+Issues = "https://github.com/epiphytic/openclaw-voice/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/openclaw_voice"]
+
+[tool.ruff]
+src = ["src"]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]  # line length handled by formatter
+
+[tool.ruff.lint.isort]
+known-first-party = ["openclaw_voice"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-v"
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true

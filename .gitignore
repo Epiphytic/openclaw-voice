@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.whl
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env
+
+# Testing
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Ruff / linters
+.ruff_cache/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Local config overrides
+config.local.toml
+*.local.toml
+
+# Speaker profiles (user data, not committed)
+profiles/
+speaker-profiles/
+
+# Logs
+logs/
+*.jsonl
+
+# Model weights / large files
+*.bin
+*.pt
+*.gguf

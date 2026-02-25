@@ -1,0 +1,73 @@
+# openclaw-voice configuration example
+# Copy to config.toml and adjust as needed.
+
+# -----------------------------------------------------------------------------
+# Global settings
+# -----------------------------------------------------------------------------
+log_level = "INFO"  # DEBUG, INFO, WARNING, ERROR
+
+# -----------------------------------------------------------------------------
+# Wyoming STT Bridge (connects Home Assistant → whisper.cpp)
+# -----------------------------------------------------------------------------
+[stt]
+# Where this bridge listens for Wyoming connections
+host = "0.0.0.0"
+port = 10300
+
+# Upstream whisper.cpp server
+whisper_url = "http://localhost:8001/inference"
+whisper_timeout = 30.0
+
+# Whisper model metadata (advertised to Home Assistant)
+model_name = "large-v3-turbo"
+model_description = "Large v3 Turbo (GPU accelerated)"
+languages = ["en"]
+
+# Speaker Identification (optional)
+enable_speaker_id = true
+speaker_id_url = "http://localhost:8003/identify"
+speaker_id_threshold = 0.75
+
+# Log transcripts to a JSONL file (useful for debugging or downstream processing)
+transcript_log = "logs/transcripts.jsonl"
+
+# -----------------------------------------------------------------------------
+# Wyoming TTS Bridge (connects Home Assistant → Kokoro)
+# -----------------------------------------------------------------------------
+[tts]
+# Where this bridge listens for Wyoming connections
+host = "0.0.0.0"
+port = 10200
+
+# Upstream Kokoro TTS server (OpenAI-compatible endpoint)
+kokoro_url = "http://localhost:8002/v1/audio/speech"
+
+# Default voice if none specified by client
+# Can be a native Kokoro voice (af_heart, am_adam) or OpenAI alias (alloy, echo)
+default_voice = "af_heart"
+
+# Speech speed (0.5 to 2.0)
+speed = 1.0
+
+# HTTP timeout for synthesis requests
+http_timeout = 60.0
+
+# Additional voices to advertise (beyond defaults)
+extra_voices = []
+
+# -----------------------------------------------------------------------------
+# Speaker ID Server (Resemblyzer)
+# -----------------------------------------------------------------------------
+[speaker_id]
+# Where the Speaker ID API listens
+host = "0.0.0.0"
+port = 8003
+
+# Directory to store speaker profiles (JSON files)
+profiles_dir = "./speaker-profiles"
+
+# Default confidence threshold
+threshold = 0.75
+
+# Compute device ("cpu" or "cuda")
+device = "cpu"

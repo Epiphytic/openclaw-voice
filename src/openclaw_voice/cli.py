@@ -567,6 +567,7 @@ def discord_bot_cmd(
         default_timezone=cfg_file.get("default_timezone", "UTC"),
         extra_context=cfg_file.get("extra_context", ""),
         whisper_prompt=cfg_file.get("whisper_prompt", ""),
+        corrections_file=cfg_file.get("corrections_file", ""),
     )
 
     # Resolve VAD and transcript settings (CLI > env > config file > defaults)
@@ -575,6 +576,9 @@ def discord_bot_cmd(
     )
     resolved_vad_min_speech_ms: int = vad_min_speech_ms or int(
         cfg_file.get("vad_min_speech_ms", DEFAULT_VAD_MIN_SPEECH_MS)
+    )
+    resolved_speech_end_delay_ms: int = int(
+        cfg_file.get("speech_end_delay_ms", 1000)
     )
     raw_channel_id = transcript_channel_id or cfg_file.get("transcript_channel_id")
     resolved_transcript_channel_id: int | None = int(raw_channel_id) if raw_channel_id else None
@@ -585,6 +589,7 @@ def discord_bot_cmd(
         transcript_channel_id=resolved_transcript_channel_id,
         vad_silence_ms=resolved_vad_silence_ms,
         vad_min_speech_ms=resolved_vad_min_speech_ms,
+        speech_end_delay_ms=resolved_speech_end_delay_ms,
     )
 
     log.info(
@@ -595,6 +600,7 @@ def discord_bot_cmd(
             "tts_voice": pipeline_config.tts_voice,
             "vad_silence_ms": resolved_vad_silence_ms,
             "vad_min_speech_ms": resolved_vad_min_speech_ms,
+            "speech_end_delay_ms": resolved_speech_end_delay_ms,
             "transcript_channel_id": resolved_transcript_channel_id,
         },
     )

@@ -41,9 +41,12 @@ from __future__ import annotations
 
 import io
 import logging
+import re
+import sys
 import time
 import wave
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 
 import httpx
 
@@ -133,6 +136,16 @@ class PipelineConfig:
 
     # Whisper vocabulary hint (helps with unusual names/terms)
     whisper_prompt: str = ""
+
+    # Post-STT word corrections file (TOML with [corrections] section)
+    corrections_file: str = ""
+    # Loaded correction map (populated by __post_init__)
+    _corrections: dict[str, str] = field(default_factory=dict, repr=False)
+
+    def __post_init__(self) -> None:
+        """Load corrections from TOML file if configured."""
+        if self.corrections_file:
+            self._corrections = _load_corrections(self.corrections_file)
 
     # Identity & context (loaded from config file, not hardcoded)
     bot_name: str = "Assistant"
@@ -256,6 +269,16 @@ class VoicePipeline:
                 )
                 return ""
 
+            # Apply post-STT word corrections
+            if self._config._corrections:
+                corrected = _apply_corrections(transcript, self._config._corrections)
+                if corrected != transcript:
+                    log.info(
+                        "Applied word corrections",
+                        extra={"user_id": user_id, "before": transcript, "after": corrected},
+                    )
+                    transcript = corrected
+
             log.info(
                 "Transcribed utterance",
                 extra={"user_id": user_id, "transcript": transcript, "stt_ms": stt_ms},
@@ -319,7 +342,8 @@ class VoicePipeline:
                 log.debug("LLM returned text (no tool call): %.100s", result)
 
                 # Fallback: if the LLM hedges without calling a tool, force escalation
-                text_lower = result.lower()
+                # Normalize curly quotes to straight quotes before matching
+                text_lower = result.lower().replace("\u2019", "'").replace("\u2018", "'")
                 fallback_triggers = [
                     "let me check",
                     "let me find",
@@ -338,6 +362,8 @@ class VoicePipeline:
                     "i don't know what",
                     "checking the channel",
                     "checking with",
+                    "check with bel",
+                    "check with " + self.main_agent_name.lower(),
                 ]
                 if any(phrase in text_lower for phrase in fallback_triggers):
                     log.info(
@@ -374,10 +400,9 @@ class VoicePipeline:
 
                 if fn_name == "escalate_to_bel":
                     escalation = fn_args.get("request", "")
-                    tool_result = (
-                        "Escalation sent to Bel. Tell the user you're checking "
-                        "with Bel and will have an answer shortly."
-                    )
+                    # Return immediately — don't loop back for another LLM
+                    # round that would generate chatty hedging text.
+                    return "", escalation
                 else:
                     tool_result = execute_tool(fn_name, fn_args) or f"Unknown tool: {fn_name}"
 
@@ -589,6 +614,68 @@ class VoicePipeline:
         audio = b"".join(chunks)
         log.debug("TTS synthesis complete", extra={"audio_bytes": len(audio)})
         return audio
+
+
+# ---------------------------------------------------------------------------
+# Word correction helpers
+# ---------------------------------------------------------------------------
+
+
+def _load_corrections(path: str) -> dict[str, str]:
+    """Load word corrections from a TOML file.
+
+    Expected format::
+
+        [corrections]
+        "wrong" = "right"
+
+    Args:
+        path: Path to the TOML corrections file.
+
+    Returns:
+        Dict mapping lowercase wrong → right replacement strings.
+    """
+    p = Path(path)
+    if not p.is_file():
+        log.warning("Corrections file not found: %s", path)
+        return {}
+    try:
+        if sys.version_info >= (3, 11):
+            import tomllib
+        else:
+            import tomli as tomllib  # type: ignore[no-redef]
+        data = tomllib.loads(p.read_text())
+        corrections = data.get("corrections", {})
+        # Normalise keys to lowercase for case-insensitive matching
+        result = {k.lower(): v for k, v in corrections.items()}
+        log.info("Loaded %d word corrections from %s", len(result), path)
+        return result
+    except Exception as exc:
+        log.error("Failed to load corrections from %s: %s", path, exc)
+        return {}
+
+
+def _apply_corrections(text: str, corrections: dict[str, str]) -> str:
+    """Apply word-boundary-aware corrections to transcribed text.
+
+    Matching is case-insensitive. The replacement preserves no surrounding
+    case context — it uses the replacement value as-is (since corrections
+    are deliberate mappings like "Bell" → "Bel").
+
+    Args:
+        text:        Input transcript text.
+        corrections: Dict of lowercase_wrong → right.
+
+    Returns:
+        Corrected text.
+    """
+    if not corrections:
+        return text
+    for wrong, right in corrections.items():
+        # Word-boundary-aware, case-insensitive replacement
+        pattern = re.compile(r"\b" + re.escape(wrong) + r"\b", re.IGNORECASE)
+        text = pattern.sub(right, text)
+    return text
 
 
 # ---------------------------------------------------------------------------

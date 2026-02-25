@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import contextlib
+import json
 import logging
 import tempfile
 import time
@@ -70,6 +71,8 @@ DEFAULT_VAD_MIN_SPEECH_MS = 500
 # Escalation worker timing
 ESCALATION_KEEPALIVE_S = 20
 ESCALATION_MAX_WAIT_S = 120
+
+_VOICE_STATE_FILE = Path.home() / ".openclaw" / "workspace" / "openclaw-voice" / "voice_state.json"
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +134,7 @@ class VoiceSink(Sink):  # type: ignore[misc]
         # Per-user debounce timer handles (asyncio.TimerHandle)
         self._flush_timers: dict[int, asyncio.TimerHandle] = {}
         # Debounce delay: flush this many seconds after last packet
-        self._flush_delay_s = 0.25
+        self._flush_delay_s = 1.0
         # Keep _vad_instances for mute-detection compatibility
         self._vad_instances: dict[int, VoiceActivityDetector] = {}
 
@@ -335,6 +338,37 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
 
     async def on_ready(self) -> None:
         log.info("VoiceBot ready", extra={"user": str(self.user)})
+        await self._restore_voice_state()
+
+    async def _restore_voice_state(self) -> None:
+        """Auto-reconnect to the last voice channel on restart."""
+        if not _VOICE_STATE_FILE.is_file():
+            return
+        try:
+            state = json.loads(_VOICE_STATE_FILE.read_text())
+            guild_id = state["guild_id"]
+            voice_channel_id = state["voice_channel_id"]
+            text_channel_id = state["text_channel_id"]
+
+            guild = self.get_guild(guild_id)
+            if guild is None:
+                log.warning("Restore voice state: guild %s not found", guild_id)
+                return
+
+            channel = guild.get_channel(voice_channel_id)
+            if channel is None:
+                log.warning("Restore voice state: voice channel %s not found", voice_channel_id)
+                return
+
+            vc = await channel.connect()
+            self._guild_text_channels[guild_id] = text_channel_id
+            await self._start_listening(guild_id, vc)
+            log.info(
+                "Restored voice connection",
+                extra={"guild_id": guild_id, "channel": channel.name},
+            )
+        except Exception as exc:
+            log.warning("Failed to restore voice state: %s", exc)
 
     async def on_voice_state_update(
         self,
@@ -429,6 +463,16 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
         # Remember the text channel where /join was invoked for transcripts
         self._guild_text_channels[guild_id] = ctx.channel_id
 
+        # Persist voice state for auto-reconnect on restart
+        try:
+            _VOICE_STATE_FILE.write_text(json.dumps({
+                "guild_id": guild_id,
+                "voice_channel_id": channel.id,
+                "text_channel_id": ctx.channel_id,
+            }))
+        except Exception as exc:
+            log.warning("Failed to save voice state: %s", exc)
+
         await self._start_listening(guild_id, vc)
         await ctx.respond(f"Joined **{channel.name}**. I'm listening! 🎙️")
         log.info(
@@ -448,6 +492,12 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
         await self._stop_listening(guild_id)
         self._guild_text_channels.pop(guild_id, None)
         self._guild_context.pop(guild_id, None)
+
+        # Clear persisted voice state
+        try:
+            _VOICE_STATE_FILE.unlink(missing_ok=True)
+        except Exception as exc:
+            log.warning("Failed to clear voice state: %s", exc)
         await vc.disconnect(force=True)
         await ctx.respond("Disconnected. Bye! 👋")
         log.info("Disconnected from voice channel", extra={"guild_id": guild_id})

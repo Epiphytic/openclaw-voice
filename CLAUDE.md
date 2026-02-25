@@ -56,6 +56,9 @@ ruff format .
   - `stt_bridge.py`: Wyoming → whisper.cpp (via `facades/whisper.py`)
   - `tts_bridge.py`: Wyoming → Kokoro (via `facades/kokoro.py`)
   - `speaker_id.py`: FastAPI server for Resemblyzer (via `facades/resemblyzer.py`)
+  - `vad.py`: Voice Activity Detection — segments 16kHz PCM audio into utterances
+  - `voice_pipeline.py`: STT → LLM → TTS pipeline for Discord voice sessions
+  - `discord_bot.py`: Discord voice bot (py-cord) — /join, /leave, /voice commands
   - `logging_config.py`: Structured JSON logging setup
   - `facades/`: External service facades (whisper, kokoro, resemblyzer)
 - `tests/`: Pytest suite
@@ -64,6 +67,40 @@ ruff format .
   - `docs/adrs/`: Architectural Decision Records
   - `docs/plans/`: Implementation plans (HITL gate before execution)
 - `MANIFEST.md`: Module & integration registry — update when adding modules
+
+## Discord Bot Module
+
+The Discord voice bot (`discord_bot.py`) uses **py-cord** (not discord.py) for voice receive support.
+
+### Running
+```bash
+# Install optional discord dependency group first
+pip install -e ".[discord]"
+
+# Run the bot
+openclaw-voice discord-bot --token <TOKEN> --guild-id <GUILD_ID>
+
+# With env vars
+OPENCLAW_VOICE_DISCORD_TOKEN=<TOKEN> openclaw-voice discord-bot
+```
+
+### Architecture
+- `VoiceActivityDetector` (`vad.py`): Feeds 20ms 16kHz mono PCM frames through webrtcvad; flushes complete utterances when silence threshold is reached.
+- `VoicePipeline` (`voice_pipeline.py`): Synchronous pipeline: `process_utterance(pcm, user_id) → (text, wav_bytes)`. Maintains per-channel deque conversation history.
+- `VoiceBot` (`discord_bot.py`): pycord `Bot` subclass. Custom `VoiceSink` downsamples 48kHz stereo Discord audio → 16kHz mono before VAD. Utterances queued and processed via thread pool (non-blocking event loop). Responses played back via `FFmpegPCMAudio`.
+
+### Slash Commands
+- `/join` — joins the calling user's voice channel
+- `/leave` — disconnects the bot
+- `/voice <name>` — change TTS voice (e.g. `af_heart`, `af_nova`)
+
+### Dependencies (optional group `discord`)
+- `py-cord[voice]>=2.6` — Discord API + voice support
+- `PyNaCl>=1.5` — voice channel encryption
+
+### Key Env Vars
+- `OPENCLAW_VOICE_DISCORD_TOKEN` — bot token
+- `OPENCLAW_VOICE_GUILD_ID` — guild ID for slash command registration (optional)
 
 ## Convention
 - **Imports**: `from __future__ import annotations` at top of every file.

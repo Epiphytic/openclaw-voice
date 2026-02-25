@@ -1521,6 +1521,7 @@ def create_bot(
 
     intents = discord.Intents.default()
     intents.voice_states = True
+    intents.members = True
     # Message Content is a privileged intent — must be enabled in Discord
     # Developer Portal. Only request it if tts_read_channel is enabled.
     if pipeline_config and pipeline_config.tts_read_channel:

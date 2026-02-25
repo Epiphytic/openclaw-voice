@@ -94,9 +94,7 @@ class KokoroFacade:
             httpx.HTTPStatusError: On non-2xx HTTP response.
             httpx.RequestError:    On connection failure.
         """
-        payload = self.build_payload(
-            text, voice, response_format=response_format, speed=speed
-        )
+        payload = self.build_payload(text, voice, response_format=response_format, speed=speed)
 
         log.debug(
             "Starting Kokoro synthesis stream",

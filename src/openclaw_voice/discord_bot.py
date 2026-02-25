@@ -42,17 +42,18 @@ log = logging.getLogger("openclaw_voice.discord_bot")
 try:
     import discord
     from discord.sinks import Sink  # type: ignore[attr-defined]
+
     _PYCORD_AVAILABLE = True
 except ImportError:
     _PYCORD_AVAILABLE = False
     discord = None  # type: ignore[assignment]
-    Sink = object   # type: ignore[assignment,misc]
+    Sink = object  # type: ignore[assignment,misc]
 
 # Sample rates
-DISCORD_SAMPLE_RATE = 48_000   # Discord sends 48kHz stereo opus/PCM
-WHISPER_SAMPLE_RATE = 16_000   # whisper.cpp requires 16kHz mono
+DISCORD_SAMPLE_RATE = 48_000  # Discord sends 48kHz stereo opus/PCM
+WHISPER_SAMPLE_RATE = 16_000  # whisper.cpp requires 16kHz mono
 DISCORD_CHANNELS = 2
-DISCORD_SAMPLE_WIDTH = 2       # int16
+DISCORD_SAMPLE_WIDTH = 2  # int16
 
 # Max size of the response playback queue
 PLAYBACK_QUEUE_MAXSIZE = 10
@@ -69,6 +70,7 @@ DEFAULT_VAD_MIN_SPEECH_MS = 500
 # ---------------------------------------------------------------------------
 # VAD Sink (pycord voice receive)
 # ---------------------------------------------------------------------------
+
 
 class VoiceSink(Sink):  # type: ignore[misc]
     """Custom pycord Sink that feeds per-user audio through VAD.
@@ -161,9 +163,7 @@ class VoiceSink(Sink):  # type: ignore[misc]
                         self._utterance_queue.put_nowait,
                         (user, utterance, enqueued_at, seq),
                     )
-                    log.debug(
-                        "Utterance enqueued for user %s (seq=%d)", user, seq
-                    )
+                    log.debug("Utterance enqueued for user %s (seq=%d)", user, seq)
             except Exception as exc:
                 log.warning("VAD error for user %s: %s", user, exc)
 
@@ -178,6 +178,7 @@ class VoiceSink(Sink):  # type: ignore[misc]
 # ---------------------------------------------------------------------------
 # Voice Bot
 # ---------------------------------------------------------------------------
+
 
 class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[misc]
     """Discord bot that listens in voice channels and responds via TTS.
@@ -352,9 +353,7 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
         self._processing_tasks[guild_id] = asyncio.create_task(
             self._process_utterances(guild_id, vc)
         )
-        self._playback_tasks[guild_id] = asyncio.create_task(
-            self._playback_worker(guild_id, vc)
-        )
+        self._playback_tasks[guild_id] = asyncio.create_task(self._playback_worker(guild_id, vc))
 
         log.info("Started listening in guild %s", guild_id)
 
@@ -427,9 +426,7 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
 
                 # Start a new per-user task for this utterance
                 task: asyncio.Task = asyncio.create_task(  # type: ignore[type-arg]
-                    self._run_single_utterance(
-                        guild_id, vc, user_id, pcm_bytes, enqueued_at, seq
-                    ),
+                    self._run_single_utterance(guild_id, vc, user_id, pcm_bytes, enqueued_at, seq),
                     name=f"pipeline-{guild_id}-{user_id}-{seq}",
                 )
                 user_tasks[user_id] = task
@@ -554,10 +551,10 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
             log.debug("Could not resolve display name for user %s: %s", user_id, exc)
 
         import datetime
+
         ts = datetime.datetime.now().strftime("%H:%M")
         message = (
-            f'**{display_name}** ({ts}): "{transcript}"\n'
-            f'**Assistant** ({ts}): "{response_text}"'
+            f'**{display_name}** ({ts}): "{transcript}"\n**Assistant** ({ts}): "{response_text}"'
         )
 
         try:
@@ -565,9 +562,7 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
                 self._transcript_channel_id,
                 content=message,
             )
-            log.debug(
-                "Transcript posted to channel %s", self._transcript_channel_id
-            )
+            log.debug("Transcript posted to channel %s", self._transcript_channel_id)
         except Exception as exc:
             log.warning(
                 "Failed to post transcript to channel %s: %s",
@@ -649,6 +644,7 @@ def _resample_48k_stereo_to_16k_mono(pcm: bytes) -> bytes:
 
     try:
         import audioop  # type: ignore[import]
+
         # Stereo → mono
         mono = audioop.tomono(pcm, 2, 0.5, 0.5)
         # 48kHz → 16kHz (factor 3)
@@ -659,13 +655,12 @@ def _resample_48k_stereo_to_16k_mono(pcm: bytes) -> bytes:
 
     # Fallback: manual decimation (every 3rd sample from averaged stereo)
     import struct
+
     n_samples = len(pcm) // 4  # 4 bytes per stereo sample (2ch * int16)
     stereo = struct.unpack(f"<{n_samples * 2}h", pcm[: n_samples * 4])
 
     # Average stereo channels → mono
-    mono_samples = [
-        (stereo[i * 2] + stereo[i * 2 + 1]) // 2 for i in range(n_samples)
-    ]
+    mono_samples = [(stereo[i * 2] + stereo[i * 2 + 1]) // 2 for i in range(n_samples)]
 
     # Decimate by 3 (48kHz / 3 = 16kHz)
     decimated = mono_samples[::3]
@@ -697,9 +692,7 @@ def create_bot(
         Configured VoiceBot ready to run.
     """
     if not _PYCORD_AVAILABLE:
-        raise ImportError(
-            "py-cord is required. Install with: pip install 'py-cord[voice]' PyNaCl"
-        )
+        raise ImportError("py-cord is required. Install with: pip install 'py-cord[voice]' PyNaCl")
 
     intents = discord.Intents.default()
     intents.voice_states = True

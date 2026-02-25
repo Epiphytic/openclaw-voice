@@ -171,19 +171,25 @@ class TestEnrollEndpoint:
 
         with (
             patch("openclaw_voice.facades.resemblyzer.get_encoder") as mock_enc,
-            patch("openclaw_voice.speaker_id.audio_to_array", return_value=np.zeros(16000, dtype=np.float32)),
+            patch(
+                "openclaw_voice.speaker_id.audio_to_array",
+                return_value=np.zeros(16000, dtype=np.float32),
+            ),
         ):
             mock_encoder = MagicMock()
             mock_encoder.embed_utterance.return_value = fake_embedding
             mock_enc.return_value = mock_encoder
 
-            with patch("openclaw_voice.speaker_id.preprocess", return_value=np.zeros(16000)) as _mock_pp:
+            with patch(
+                "openclaw_voice.speaker_id.preprocess", return_value=np.zeros(16000)
+            ) as _mock_pp:
                 # Import within patch scope to ensure preprocess_wav is patched at module level
                 pass
 
             # Re-patch at the right level
             with patch("resemblyzer.preprocess_wav", return_value=np.zeros(16000), create=True):
                 import sys
+
                 # Inject resemblyzer mock if not installed
                 if "resemblyzer" not in sys.modules:
                     mock_resemblyzer = MagicMock()
@@ -227,9 +233,15 @@ class TestIdentifyEndpoint:
 
         with (
             patch("openclaw_voice.facades.resemblyzer.get_encoder") as mock_enc,
-            patch("openclaw_voice.speaker_id.preprocess", return_value=np.zeros(16000, dtype=np.float32)),
+            patch(
+                "openclaw_voice.speaker_id.preprocess",
+                return_value=np.zeros(16000, dtype=np.float32),
+            ),
             patch("openclaw_voice.speaker_id.embed_utterance", return_value=fake_embedding),
-            patch("openclaw_voice.speaker_id.audio_to_array", return_value=np.zeros(16000, dtype=np.float32)),
+            patch(
+                "openclaw_voice.speaker_id.audio_to_array",
+                return_value=np.zeros(16000, dtype=np.float32),
+            ),
         ):
             mock_encoder = MagicMock()
             mock_encoder.embed_utterance.return_value = fake_embedding

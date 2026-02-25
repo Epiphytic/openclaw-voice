@@ -51,8 +51,8 @@ from openclaw_voice.facades.resemblyzer import embed_utterance, get_encoder, pre
 log = logging.getLogger("openclaw_voice.speaker_id")
 
 # Minimum audio lengths
-MIN_IDENTIFY_SAMPLES = 1600   # ~0.1s at 16kHz
-MIN_ENROLL_SAMPLES = 8000     # ~0.5s at 16kHz
+MIN_IDENTIFY_SAMPLES = 1600  # ~0.1s at 16kHz
+MIN_ENROLL_SAMPLES = 8000  # ~0.5s at 16kHz
 TARGET_SAMPLE_RATE = 16000
 
 
@@ -226,9 +226,7 @@ def create_app(config: SpeakerIDConfig) -> FastAPI:
         elapsed = round(time.time() - start, 3)
 
         if best_score >= threshold and best_name:
-            access_level = (
-                profiles[best_name].get("metadata", {}).get("access_level", "standard")
-            )
+            access_level = profiles[best_name].get("metadata", {}).get("access_level", "standard")
             return JSONResponse(
                 {
                     "speaker": best_name,
@@ -315,8 +313,7 @@ def create_app(config: SpeakerIDConfig) -> FastAPI:
                     "speaker": name,
                     "samples": 1,
                     "message": (
-                        f"Enrolled '{name}' with 1 sample. "
-                        "Add more samples for better accuracy."
+                        f"Enrolled '{name}' with 1 sample. Add more samples for better accuracy."
                     ),
                 }
             )

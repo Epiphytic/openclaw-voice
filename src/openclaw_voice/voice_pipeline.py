@@ -109,9 +109,7 @@ class VoicePipeline:
 
         # history: list of {"role": ..., "content": ...} dicts
         # max size = max_history_turns * 2 (user + assistant per turn)
-        self._history: deque[dict[str, str]] = deque(
-            maxlen=self._config.max_history_turns * 2
-        )
+        self._history: deque[dict[str, str]] = deque(maxlen=self._config.max_history_turns * 2)
 
         log.info(
             "VoicePipeline initialised",
@@ -346,6 +344,7 @@ class VoicePipeline:
 
         chunks: list[bytes] = []
         try:
+
             async def _collect() -> None:
                 async for chunk in self._kokoro.stream_audio(
                     text,
@@ -361,6 +360,7 @@ class VoicePipeline:
                     # Already in an event loop (e.g. discord.py async context)
                     # schedule as a coroutine — caller must await appropriately
                     import concurrent.futures
+
                     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                         future = pool.submit(asyncio.run, _collect())
                         future.result(timeout=self._config.kokoro_timeout)

@@ -18,6 +18,7 @@ from openclaw_voice.voice_pipeline import (
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _make_pcm(duration_ms: int = 200) -> bytes:
     """Generate silent PCM bytes (16kHz mono int16)."""
     n_samples = 16_000 * duration_ms // 1000
@@ -42,6 +43,7 @@ def _make_config(**kwargs) -> PipelineConfig:
 # ---------------------------------------------------------------------------
 # _pcm_to_wav utility
 # ---------------------------------------------------------------------------
+
 
 class TestPcmToWav:
     def test_returns_valid_wav(self):
@@ -70,6 +72,7 @@ class TestPcmToWav:
 # PipelineConfig defaults
 # ---------------------------------------------------------------------------
 
+
 class TestPipelineConfig:
     def test_defaults(self):
         cfg = PipelineConfig()
@@ -96,6 +99,7 @@ class TestPipelineConfig:
 # VoicePipeline init
 # ---------------------------------------------------------------------------
 
+
 class TestVoicePipelineInit:
     def test_default_config(self):
         pipeline = VoicePipeline()
@@ -114,6 +118,7 @@ class TestVoicePipelineInit:
 # ---------------------------------------------------------------------------
 # Full pipeline: mock everything
 # ---------------------------------------------------------------------------
+
 
 class TestFullPipeline:
     def _make_pipeline(self, **kwargs) -> VoicePipeline:
@@ -139,6 +144,7 @@ class TestFullPipeline:
         # Mock KokoroFacade — stream_audio is an async generator
         async def _fake_stream(*args, **kwargs):
             yield _make_wav(100)
+
         mock_kokoro = MagicMock()
         mock_kokoro.stream_audio = _fake_stream
         mock_kokoro_cls.return_value = mock_kokoro
@@ -149,9 +155,7 @@ class TestFullPipeline:
         with patch("httpx.Client") as mock_client_cls:
             mock_resp = MagicMock()
             mock_resp.status_code = 200
-            mock_resp.json.return_value = {
-                "choices": [{"message": {"content": "Hi there!"}}]
-            }
+            mock_resp.json.return_value = {"choices": [{"message": {"content": "Hi there!"}}]}
             mock_resp.raise_for_status = MagicMock()
             mock_client = MagicMock()
             mock_client.__enter__ = lambda s: mock_client
@@ -247,6 +251,7 @@ class TestFullPipeline:
 # Conversation history management
 # ---------------------------------------------------------------------------
 
+
 class TestConversationHistory:
     def _make_pipeline(self, max_turns: int = 5) -> VoicePipeline:
         return VoicePipeline(
@@ -264,6 +269,7 @@ class TestConversationHistory:
 
         async def _fake_stream(*args, **kwargs):
             yield _make_wav(50)
+
         mock_kokoro = MagicMock()
         mock_kokoro.stream_audio = _fake_stream
         mock_kokoro_cls.return_value = mock_kokoro
@@ -272,9 +278,7 @@ class TestConversationHistory:
 
         with patch("httpx.Client") as mock_client_cls:
             mock_resp = MagicMock()
-            mock_resp.json.return_value = {
-                "choices": [{"message": {"content": "Hey!"}}]
-            }
+            mock_resp.json.return_value = {"choices": [{"message": {"content": "Hey!"}}]}
             mock_resp.raise_for_status = MagicMock()
             mock_client = MagicMock()
             mock_client.__enter__ = lambda s: mock_client
@@ -304,15 +308,14 @@ class TestConversationHistory:
 
         async def _fake_stream(*args, **kwargs):
             yield _make_wav(50)
+
         mock_kokoro = MagicMock()
         mock_kokoro.stream_audio = _fake_stream
         mock_kokoro_cls.return_value = mock_kokoro
 
         with patch("httpx.Client") as mock_client_cls:
             mock_resp = MagicMock()
-            mock_resp.json.return_value = {
-                "choices": [{"message": {"content": "Hello!"}}]
-            }
+            mock_resp.json.return_value = {"choices": [{"message": {"content": "Hello!"}}]}
             mock_resp.raise_for_status = MagicMock()
             mock_client = MagicMock()
             mock_client.__enter__ = lambda s: mock_client
@@ -365,6 +368,7 @@ class TestConversationHistory:
 # Speaker ID (optional)
 # ---------------------------------------------------------------------------
 
+
 class TestSpeakerIdIntegration:
     @patch("openclaw_voice.voice_pipeline.KokoroFacade")
     @patch("openclaw_voice.voice_pipeline.WhisperFacade")
@@ -376,6 +380,7 @@ class TestSpeakerIdIntegration:
 
         async def _fake_stream(*args, **kwargs):
             yield _make_wav(50)
+
         mock_kokoro = MagicMock()
         mock_kokoro.stream_audio = _fake_stream
         mock_kokoro_cls.return_value = mock_kokoro
@@ -387,9 +392,7 @@ class TestSpeakerIdIntegration:
 
         with patch("httpx.Client") as mock_client_cls:
             mock_resp_llm = MagicMock()
-            mock_resp_llm.json.return_value = {
-                "choices": [{"message": {"content": "Answer"}}]
-            }
+            mock_resp_llm.json.return_value = {"choices": [{"message": {"content": "Answer"}}]}
             mock_resp_llm.raise_for_status = MagicMock()
 
             mock_resp_sid = MagicMock()

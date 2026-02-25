@@ -174,11 +174,10 @@ def stt_cmd(
         speaker_id_url=speaker_id_url
         or cfg_file.get("speaker_id_url", "http://localhost:8003/identify"),
         enable_speaker_id=speaker_id or cfg_file.get("enable_speaker_id", False),
-        speaker_id_threshold=speaker_id_threshold
-        or cfg_file.get("speaker_id_threshold", 0.75),
-        transcript_log=Path(transcript_log) if transcript_log else (
-            Path(cfg_file["transcript_log"]) if "transcript_log" in cfg_file else None
-        ),
+        speaker_id_threshold=speaker_id_threshold or cfg_file.get("speaker_id_threshold", 0.75),
+        transcript_log=Path(transcript_log)
+        if transcript_log
+        else (Path(cfg_file["transcript_log"]) if "transcript_log" in cfg_file else None),
         model_name=model_name or cfg_file.get("model_name", "large-v3-turbo"),
         whisper_timeout=whisper_timeout or cfg_file.get("whisper_timeout", 30.0),
     )
@@ -247,9 +246,7 @@ def tts_cmd(
 @_config_option
 @_log_level_option
 @click.option("--host", default=lambda: _env("SPEAKER_ID_HOST", "0.0.0.0"), help="Bind host")
-@click.option(
-    "--port", default=lambda: _env("SPEAKER_ID_PORT", "8003"), type=int, help="Bind port"
-)
+@click.option("--port", default=lambda: _env("SPEAKER_ID_PORT", "8003"), type=int, help="Bind port")
 @click.option(
     "--profiles-dir",
     default=lambda: _env("PROFILES_DIR", "./speaker-profiles"),
@@ -493,9 +490,9 @@ def discord_bot_cmd(
     resolved_token = token or cfg_file.get("token")
     if not resolved_token:
         import click as _click
+
         raise _click.ClickException(
-            "Discord bot token is required. "
-            "Pass --token or set OPENCLAW_VOICE_DISCORD_TOKEN."
+            "Discord bot token is required. Pass --token or set OPENCLAW_VOICE_DISCORD_TOKEN."
         )
 
     # Resolve guild IDs
@@ -515,30 +512,26 @@ def discord_bot_cmd(
 
     pipeline_config = PipelineConfig(
         whisper_url=whisper_url or cfg_file.get("whisper_url", "http://localhost:8001/inference"),
-        kokoro_url=kokoro_url or cfg_file.get("kokoro_url", "http://localhost:8002/v1/audio/speech"),
+        kokoro_url=kokoro_url
+        or cfg_file.get("kokoro_url", "http://localhost:8002/v1/audio/speech"),
         llm_url=llm_url or cfg_file.get("llm_url", "http://localhost:8000/v1/chat/completions"),
         llm_model=llm_model or cfg_file.get("llm_model", "Qwen/Qwen2.5-32B-Instruct"),
         tts_voice=tts_voice or cfg_file.get("tts_voice", "af_heart"),
         enable_speaker_id=speaker_id or cfg_file.get("enable_speaker_id", False),
-        speaker_id_url=speaker_id_url or cfg_file.get(
-            "speaker_id_url", "http://localhost:8003/identify"
-        ),
+        speaker_id_url=speaker_id_url
+        or cfg_file.get("speaker_id_url", "http://localhost:8003/identify"),
         max_history_turns=max_history or cfg_file.get("max_history_turns", 20),
     )
 
     # Resolve VAD and transcript settings (CLI > env > config file > defaults)
-    resolved_vad_silence_ms: int = (
-        vad_silence_ms
-        or int(cfg_file.get("vad_silence_ms", DEFAULT_VAD_SILENCE_MS))
+    resolved_vad_silence_ms: int = vad_silence_ms or int(
+        cfg_file.get("vad_silence_ms", DEFAULT_VAD_SILENCE_MS)
     )
-    resolved_vad_min_speech_ms: int = (
-        vad_min_speech_ms
-        or int(cfg_file.get("vad_min_speech_ms", DEFAULT_VAD_MIN_SPEECH_MS))
+    resolved_vad_min_speech_ms: int = vad_min_speech_ms or int(
+        cfg_file.get("vad_min_speech_ms", DEFAULT_VAD_MIN_SPEECH_MS)
     )
     raw_channel_id = transcript_channel_id or cfg_file.get("transcript_channel_id")
-    resolved_transcript_channel_id: int | None = (
-        int(raw_channel_id) if raw_channel_id else None
-    )
+    resolved_transcript_channel_id: int | None = int(raw_channel_id) if raw_channel_id else None
 
     bot = create_bot(
         pipeline_config=pipeline_config,

@@ -24,10 +24,10 @@ import webrtcvad  # type: ignore[import]
 log = logging.getLogger("openclaw_voice.vad")
 
 # Expected frame parameters
-SAMPLE_RATE = 16_000        # Hz
-SAMPLE_WIDTH = 2            # bytes (int16)
+SAMPLE_RATE = 16_000  # Hz
+SAMPLE_WIDTH = 2  # bytes (int16)
 CHANNELS = 1
-FRAME_DURATION_MS = 20      # ms per frame
+FRAME_DURATION_MS = 20  # ms per frame
 FRAME_SIZE = int(SAMPLE_RATE * FRAME_DURATION_MS / 1000) * SAMPLE_WIDTH  # 640 bytes
 
 
@@ -69,8 +69,8 @@ class VoiceActivityDetector:
 
         # State
         self._speaking: bool = False
-        self._speech_frames: list[bytes] = []   # frames collected during speech
-        self._silence_count: int = 0            # consecutive silent frames seen
+        self._speech_frames: list[bytes] = []  # frames collected during speech
+        self._silence_count: int = 0  # consecutive silent frames seen
 
         log.debug(
             "VoiceActivityDetector initialised",

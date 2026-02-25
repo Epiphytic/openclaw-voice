@@ -160,13 +160,9 @@ class WhisperEventHandler(AsyncEventHandler):
 
         # Run transcription and (optional) speaker ID in parallel
         loop = asyncio.get_event_loop()
-        tasks: list[asyncio.Task] = [
-            loop.run_in_executor(None, self._transcribe_sync, wav_data)
-        ]
+        tasks: list[asyncio.Task] = [loop.run_in_executor(None, self._transcribe_sync, wav_data)]
         if self.config.enable_speaker_id:
-            tasks.append(
-                loop.run_in_executor(None, self._identify_speaker_sync, wav_data)
-            )
+            tasks.append(loop.run_in_executor(None, self._identify_speaker_sync, wav_data))
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
 

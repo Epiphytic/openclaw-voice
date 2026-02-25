@@ -16,6 +16,7 @@ from openclaw_voice.vad import (
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _silent_frame() -> bytes:
     """Return a 20ms frame of silence (all zeros)."""
     return b"\x00" * FRAME_SIZE
@@ -36,6 +37,7 @@ def _make_frames(n: int, frame_fn) -> list[bytes]:
 # ---------------------------------------------------------------------------
 # Initialisation
 # ---------------------------------------------------------------------------
+
 
 class TestVoiceActivityDetectorInit:
     def test_defaults(self):
@@ -62,6 +64,7 @@ class TestVoiceActivityDetectorInit:
 # Frame validation
 # ---------------------------------------------------------------------------
 
+
 class TestFrameValidation:
     def test_wrong_frame_size_raises(self):
         vad = VoiceActivityDetector()
@@ -84,6 +87,7 @@ class TestFrameValidation:
 # Silence detection
 # ---------------------------------------------------------------------------
 
+
 class TestSilenceDetection:
     def test_silence_does_not_trigger_utterance(self):
         vad = VoiceActivityDetector()
@@ -101,6 +105,7 @@ class TestSilenceDetection:
 # ---------------------------------------------------------------------------
 # Speech detection and utterance flushing
 # ---------------------------------------------------------------------------
+
 
 class TestSpeechDetection:
     def test_speech_sets_speaking_state(self):
@@ -165,6 +170,7 @@ class TestSpeechDetection:
 # Configurable silence threshold
 # ---------------------------------------------------------------------------
 
+
 class TestConfigurableSilenceThreshold:
     def test_short_threshold_flushes_faster(self):
         """A shorter silence threshold should flush sooner than a longer one."""
@@ -213,6 +219,7 @@ class TestConfigurableSilenceThreshold:
 # ---------------------------------------------------------------------------
 # Reset
 # ---------------------------------------------------------------------------
+
 
 class TestReset:
     def test_reset_clears_state(self):

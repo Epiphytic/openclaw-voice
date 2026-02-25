@@ -628,11 +628,15 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
         channel_name = voice_channel.name if voice_channel else "unknown"
 
         # Store context for escalation messages
+        text_channel_id = self._guild_text_channels.get(guild_id)
+        text_channel_obj = self.get_channel(text_channel_id) if text_channel_id else None
+        text_channel_name = getattr(text_channel_obj, "name", None) or "unknown"
         self._guild_context[guild_id] = {
             "guild_name": guild_name,
             "guild_id": guild_id,
             "voice_channel": channel_name,
-            "text_channel_id": self._guild_text_channels.get(guild_id),
+            "text_channel_id": text_channel_id,
+            "text_channel_name": text_channel_name,
         }
 
         # Load channel memory (from the text channel where /join was invoked)
@@ -647,7 +651,7 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
 
         # Build system prompt with channel context injected
         system_prompt = pipeline.build_system_prompt()
-        context_addition = f"\n\nYou are in the '{channel_name}' voice channel on the '{guild_name}' Discord server."
+        context_addition = f"\n\nYou are in the '{channel_name}' voice channel on the '{guild_name}' Discord server. The linked text channel is #{text_channel_name}."
         if channel_memory:
             summary = channel_memory[-1500:] if len(channel_memory) > 1500 else channel_memory
             context_addition += f"\n\nRecent channel context:\n{summary}"
@@ -840,7 +844,8 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
                                         )
                                 ctx_lines.reverse()  # chronological order
                                 if ctx_lines:
-                                    header = f"[Text channel context — last {n_ctx} messages]"
+                                    ch_name = getattr(text_channel, "name", str(text_channel_id))
+                                    header = f"[Text channel #{ch_name} — last {len(ctx_lines)} messages]"
                                     system_content = (
                                         session.system_prompt
                                         + f"\n\n{header}\n"
@@ -1134,13 +1139,14 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
         voice_channel = ctx.get("voice_channel", "unknown channel")
         text_channel_id = ctx.get("text_channel_id")
 
+        text_channel_name = ctx.get("text_channel_name", "unknown")
         context_parts = [
             f"[Voice escalation from {bot_name}]",
             f"Discord guild: {guild_name} (ID: {guild_id})",
             f"Voice channel: {voice_channel}",
         ]
         if text_channel_id:
-            context_parts.append(f"Text channel ID: {text_channel_id}")
+            context_parts.append(f"Text channel: #{text_channel_name} (ID: {text_channel_id})")
 
         # Build the instruction block, including channel-post directive if available
         instructions = (
@@ -1150,8 +1156,8 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
         )
         if text_channel_id:
             instructions += (
-                f"\nAlso post your full response as a Discord message to channel "
-                f"{text_channel_id} so text participants can read it."
+                f"\nAlso post your full response as a Discord message to "
+                f"#{text_channel_name} (channel ID {text_channel_id}) so text participants can read it."
             )
 
         message = (

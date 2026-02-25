@@ -46,6 +46,8 @@ from fastapi.responses import JSONResponse
 if TYPE_CHECKING:
     pass
 
+from openclaw_voice.facades.resemblyzer import embed_utterance, get_encoder, preprocess
+
 log = logging.getLogger("openclaw_voice.speaker_id")
 
 # Minimum audio lengths
@@ -66,25 +68,6 @@ class SpeakerIDConfig:
 
     # Device for Resemblyzer ("cpu" or "cuda")
     device: str = "cpu"
-
-
-# ---------------------------------------------------------------------------
-# Voice encoder — lazy-loaded singleton (shared across requests)
-# ---------------------------------------------------------------------------
-
-_encoder: Any = None  # resemblyzer.VoiceEncoder
-
-
-def _get_encoder(device: str = "cpu") -> Any:
-    """Return a lazy-loaded Resemblyzer VoiceEncoder."""
-    global _encoder
-    if _encoder is None:
-        log.info("Loading Resemblyzer voice encoder (device=%s)...", device)
-        from resemblyzer import VoiceEncoder  # type: ignore[import]
-
-        _encoder = VoiceEncoder(device)
-        log.info("Voice encoder ready")
-    return _encoder
 
 
 # ---------------------------------------------------------------------------
@@ -205,20 +188,18 @@ def create_app(config: SpeakerIDConfig) -> FastAPI:
         if not content:
             raise HTTPException(400, "Empty file")
 
-        encoder = _get_encoder(config.device)
+        encoder = get_encoder(config.device)
 
         try:
             audio = audio_to_array(content)
         except Exception as exc:
             raise HTTPException(400, f"Could not decode audio: {exc}") from exc
 
-        from resemblyzer import preprocess_wav  # type: ignore[import]
-
-        processed = preprocess_wav(audio, source_sr=TARGET_SAMPLE_RATE)
+        processed = preprocess(audio, source_sr=TARGET_SAMPLE_RATE)
         if len(processed) < MIN_IDENTIFY_SAMPLES:
             raise HTTPException(400, "Audio too short for speaker identification (need ≥0.1s)")
 
-        embedding: np.ndarray = encoder.embed_utterance(processed)
+        embedding: np.ndarray = embed_utterance(encoder, processed)
 
         profiles = load_profiles(config.profiles_dir)
         elapsed = round(time.time() - start, 3)
@@ -287,20 +268,18 @@ def create_app(config: SpeakerIDConfig) -> FastAPI:
         if not content:
             raise HTTPException(400, "Empty file")
 
-        encoder = _get_encoder(config.device)
+        encoder = get_encoder(config.device)
 
         try:
             audio = audio_to_array(content)
         except Exception as exc:
             raise HTTPException(400, f"Could not decode audio: {exc}") from exc
 
-        from resemblyzer import preprocess_wav  # type: ignore[import]
-
-        processed = preprocess_wav(audio, source_sr=TARGET_SAMPLE_RATE)
+        processed = preprocess(audio, source_sr=TARGET_SAMPLE_RATE)
         if len(processed) < MIN_ENROLL_SAMPLES:
             raise HTTPException(400, "Audio too short — need at least 0.5 seconds")
 
-        new_embedding: np.ndarray = encoder.embed_utterance(processed)
+        new_embedding: np.ndarray = embed_utterance(encoder, processed)
 
         profiles = load_profiles(config.profiles_dir)
         if name in profiles:
@@ -394,8 +373,8 @@ def run_speaker_id(config: SpeakerIDConfig, host: str = "0.0.0.0", port: int = 8
     log.info("  Threshold:    %.2f", config.default_threshold)
     log.info("  Device:       %s", config.device)
 
-    # Pre-load model at startup
-    _get_encoder(config.device)
+    # Pre-load model at startup via facade
+    get_encoder(config.device)
 
     app = create_app(config)
     uvicorn.run(app, host=host, port=port, log_level="info")

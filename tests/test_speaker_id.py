@@ -172,14 +172,14 @@ class TestEnrollEndpoint:
         fake_embedding = np.random.rand(256).astype(np.float32)
 
         with (
-            patch("openclaw_voice.speaker_id._get_encoder") as mock_enc,
+            patch("openclaw_voice.facades.resemblyzer.get_encoder") as mock_enc,
             patch("openclaw_voice.speaker_id.audio_to_array", return_value=np.zeros(16000, dtype=np.float32)),
         ):
             mock_encoder = MagicMock()
             mock_encoder.embed_utterance.return_value = fake_embedding
             mock_enc.return_value = mock_encoder
 
-            with patch("openclaw_voice.speaker_id.preprocess_wav", return_value=np.zeros(16000)) as _mock_pp:
+            with patch("openclaw_voice.speaker_id.preprocess", return_value=np.zeros(16000)) as _mock_pp:
                 # Import within patch scope to ensure preprocess_wav is patched at module level
                 pass
 
@@ -227,7 +227,12 @@ class TestIdentifyEndpoint:
             mock_resemblyzer.preprocess_wav = MagicMock(return_value=np.zeros(16000))
             sys.modules["resemblyzer"] = mock_resemblyzer
 
-        with patch("openclaw_voice.speaker_id._get_encoder") as mock_enc:
+        with (
+            patch("openclaw_voice.facades.resemblyzer.get_encoder") as mock_enc,
+            patch("openclaw_voice.speaker_id.preprocess", return_value=np.zeros(16000, dtype=np.float32)),
+            patch("openclaw_voice.speaker_id.embed_utterance", return_value=fake_embedding),
+            patch("openclaw_voice.speaker_id.audio_to_array", return_value=np.zeros(16000, dtype=np.float32)),
+        ):
             mock_encoder = MagicMock()
             mock_encoder.embed_utterance.return_value = fake_embedding
             mock_enc.return_value = mock_encoder

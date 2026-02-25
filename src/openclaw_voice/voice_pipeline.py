@@ -26,6 +26,7 @@ from __future__ import annotations
 import io
 import logging
 import struct
+import time
 import wave
 from collections import deque
 from dataclasses import dataclass, field
@@ -131,7 +132,7 @@ class VoicePipeline:
         self,
         audio_bytes: bytes,
         user_id: str,
-    ) -> tuple[str, bytes]:
+    ) -> tuple[str, str, bytes]:
         """Process a complete utterance through the full pipeline.
 
         Args:
@@ -139,8 +140,11 @@ class VoicePipeline:
             user_id:     Discord user ID string — used as speaker hint.
 
         Returns:
-            Tuple of (response_text, response_audio_wav_bytes).
-            On any failure, returns ("", b"") and logs the error.
+            Tuple of (transcript, response_text, response_audio_wav_bytes).
+            ``transcript`` is the STT result; empty string on STT failure.
+            ``response_text`` is the LLM reply; empty on failure.
+            ``response_audio_wav_bytes`` is the TTS WAV; empty on failure.
+            All three are empty on any unhandled error.
         """
         try:
             return self._run_pipeline(audio_bytes, user_id)
@@ -149,7 +153,7 @@ class VoicePipeline:
                 "Unhandled error in voice pipeline",
                 extra={"user_id": user_id, "error": str(exc)},
             )
-            return "", b""
+            return "", "", b""
 
     def clear_history(self) -> None:
         """Clear conversation history for this channel."""
@@ -174,23 +178,32 @@ class VoicePipeline:
         self,
         audio_bytes: bytes,
         user_id: str,
-    ) -> tuple[str, bytes]:
-        """Internal pipeline execution. Exceptions propagate to caller."""
+    ) -> tuple[str, str, bytes]:
+        """Internal pipeline execution. Exceptions propagate to caller.
+
+        Returns:
+            Tuple of (transcript, response_text, response_audio_wav_bytes).
+        """
+        t_start = time.monotonic()
+
         # Step 1: Convert PCM → WAV for whisper.cpp
         wav_bytes = _pcm_to_wav(audio_bytes)
 
         # Step 2: Transcribe via whisper.cpp
+        t_stt_start = time.monotonic()
         transcript = self._whisper.transcribe(wav_bytes)
+        stt_ms = int((time.monotonic() - t_stt_start) * 1000)
+
         if not transcript:
             log.warning(
                 "Empty transcript from whisper, skipping",
-                extra={"user_id": user_id},
+                extra={"user_id": user_id, "stt_ms": stt_ms},
             )
-            return "", b""
+            return "", "", b""
 
         log.info(
             "Transcribed utterance",
-            extra={"user_id": user_id, "transcript": transcript},
+            extra={"user_id": user_id, "transcript": transcript, "stt_ms": stt_ms},
         )
 
         # Step 3: Speaker identification (optional, best-effort)
@@ -203,25 +216,48 @@ class VoicePipeline:
 
         # Step 5: Append to history and call LLM
         self._history.append({"role": "user", "content": user_content})
+        t_llm_start = time.monotonic()
         response_text = self._call_llm()
+        llm_ms = int((time.monotonic() - t_llm_start) * 1000)
 
         if not response_text:
-            log.warning("Empty LLM response", extra={"user_id": user_id})
+            log.warning(
+                "Empty LLM response",
+                extra={"user_id": user_id, "llm_ms": llm_ms},
+            )
             # Roll back the user message since we have no response
             self._history.pop()
-            return "", b""
+            return transcript, "", b""
 
         # Step 6: Append assistant response to history
         self._history.append({"role": "assistant", "content": response_text})
         log.info(
             "LLM response generated",
-            extra={"user_id": user_id, "response_preview": response_text[:100]},
+            extra={
+                "user_id": user_id,
+                "response_preview": response_text[:100],
+                "llm_ms": llm_ms,
+            },
         )
 
         # Step 7: Synthesise audio via Kokoro
+        t_tts_start = time.monotonic()
         response_audio = self._synthesize(response_text)
+        tts_ms = int((time.monotonic() - t_tts_start) * 1000)
 
-        return response_text, response_audio
+        total_ms = int((time.monotonic() - t_start) * 1000)
+        log.info(
+            "Pipeline complete",
+            extra={
+                "user_id": user_id,
+                "stt_ms": stt_ms,
+                "llm_ms": llm_ms,
+                "tts_ms": tts_ms,
+                "total_ms": total_ms,
+            },
+        )
+
+        return transcript, response_text, response_audio
 
     def _identify_speaker(self, audio_bytes: bytes, fallback_user_id: str) -> str | None:
         """Call the speaker ID endpoint. Returns speaker name or None."""

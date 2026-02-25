@@ -160,7 +160,7 @@ class TestFullPipeline:
             mock_client.post.return_value = mock_resp
             mock_client_cls.return_value = mock_client
 
-            text, audio = pipeline.process_utterance(_make_pcm(), user_id="123")
+            transcript, text, audio = pipeline.process_utterance(_make_pcm(), user_id="123")
 
         assert text == "Hi there!"
         assert isinstance(audio, bytes)
@@ -180,7 +180,7 @@ class TestFullPipeline:
         pipeline = self._make_pipeline()
 
         with patch("httpx.Client") as mock_client_cls:
-            text, audio = pipeline.process_utterance(_make_pcm(), user_id="456")
+            transcript, text, audio = pipeline.process_utterance(_make_pcm(), user_id="456")
 
         assert text == ""
         assert audio == b""
@@ -198,7 +198,7 @@ class TestFullPipeline:
         mock_kokoro_cls.return_value = MagicMock()
 
         pipeline = self._make_pipeline()
-        text, audio = pipeline.process_utterance(_make_pcm(), user_id="789")
+        transcript, text, audio = pipeline.process_utterance(_make_pcm(), user_id="789")
         assert text == ""
         assert audio == b""
 
@@ -223,7 +223,7 @@ class TestFullPipeline:
             mock_client.post.side_effect = httpx.ConnectError("Connection refused")
             mock_client_cls.return_value = mock_client
 
-            text, audio = pipeline.process_utterance(_make_pcm(), user_id="999")
+            transcript, text, audio = pipeline.process_utterance(_make_pcm(), user_id="999")
 
         assert text == ""
         assert audio == b""
@@ -239,7 +239,7 @@ class TestFullPipeline:
         mock_kokoro_cls.return_value = MagicMock()
 
         pipeline = self._make_pipeline()
-        text, audio = pipeline.process_utterance(_make_pcm(), user_id="crash-user")
+        transcript, text, audio = pipeline.process_utterance(_make_pcm(), user_id="crash-user")
         assert text == ""
         assert audio == b""
 

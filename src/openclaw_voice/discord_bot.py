@@ -455,7 +455,10 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
             if vc and vc.channel:
                 voice_member_ids = {m.id for m in vc.channel.members}
                 if message.author.id in voice_member_ids:
+                    log.debug("on_message: skipping — author %s is in voice channel", message.author.display_name)
                     return
+                else:
+                    log.debug("on_message: author %s NOT in voice (%s)", message.author.id, voice_member_ids)
 
         content = message.content.strip()
         if not content:

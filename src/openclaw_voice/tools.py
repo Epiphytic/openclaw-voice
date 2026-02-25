@@ -75,12 +75,12 @@ TOOL_DEFINITIONS = [
     {
         "type": "function",
         "function": {
-            "name": "escalate_to_bel",
+            "name": "escalate",
             "description": (
-                "Escalate a request to Bel (the main AI agent) for complex tasks. "
+                "Escalate a request to the main AI agent for complex tasks. "
                 "Use for: calendar, email, personal data, multi-step tasks, "
                 "anything requiring memory or tools you don't have. "
-                "Bel can check calendars, send messages, manage files, etc."
+                "The main agent can check calendars, send messages, manage files, etc."
             ),
             "parameters": {
                 "type": "object",
@@ -204,14 +204,14 @@ TOOL_HANDLERS: dict[str, callable] = {
     "get_weather": lambda args: get_weather(args.get("location", "")),
     "web_search": lambda args: web_search(args.get("query", "")),
     "get_time": lambda args: get_time(args.get("timezone", "America/Vancouver")),
-    # escalate_to_bel is handled specially by the caller — not here
+    # escalate is handled specially by the caller — not here
 }
 
 
 def execute_tool(name: str, arguments: dict) -> str | None:
     """Execute a tool by name. Returns result string or None if unknown.
 
-    ``escalate_to_bel`` is NOT handled here — the caller must intercept it.
+    ``escalate`` is NOT handled here — the caller must intercept it.
     """
     handler = TOOL_HANDLERS.get(name)
     if handler is None:

@@ -62,14 +62,19 @@ DEFAULT_SYSTEM_PROMPT = (
     "Never use lists, bullet points, markdown, or special characters. "
     "Be natural, warm, and conversational — like a helpful friend. "
     "\n\n"
+    "IMPORTANT: You appear as a SINGLE assistant to the user. "
+    "Never mention internal tools, backends, or other agents by name. "
+    "Never say things like 'let me check with X' or 'I'll have X do that'. "
+    "Just say 'one moment' or 'let me check' and call the tool silently."
+    "\n\n"
     "TOOLS — you MUST use them, not just talk about them:\n"
     "- get_weather: weather/forecast questions\n"
     "- get_time: current time/date\n"
     "- web_search: factual questions, current events\n"
-    "- escalate_to_bel: ANYTHING about the main agent, calendar, email, "
-    "personal data, project status, channel activity, or tasks you cannot do yourself. "
-    "If someone asks about what the main agent is doing, working on, or has said — "
-    "ALWAYS call escalate_to_bel. Never say 'I don't know' or 'I'll check' without calling the tool."
+    "- escalate: ANYTHING about calendar, email, personal data, "
+    "project status, channel activity, code changes, or tasks you cannot do yourself. "
+    "If someone asks about ongoing work, what's been done, or what's happening — "
+    "ALWAYS call escalate. Never say 'I don't know' or 'I'll check' without calling the tool."
     "\n/no_think"
 )
 
@@ -142,6 +147,12 @@ class PipelineConfig:
     # Loaded correction map (populated by __post_init__)
     _corrections: dict[str, str] = field(default_factory=dict, repr=False)
 
+    # Text channel context injection into LLM prompts
+    channel_context_messages: int = 10
+
+    # Text-to-voice bridge: read aloud messages posted to the linked text channel
+    tts_read_channel: bool = True
+
     def __post_init__(self) -> None:
         """Load corrections from TOML file if configured."""
         if self.corrections_file:
@@ -163,9 +174,9 @@ class PipelineConfig:
             identity_parts.append(f"Your name is {self.bot_name}.")
         if self.main_agent_name and self.main_agent_name != "main agent":
             identity_parts.append(
-                f"You work alongside {self.main_agent_name} (the main AI agent). "
-                f"When a request needs {self.main_agent_name}, you MUST call the escalate_to_bel tool — "
-                f"do NOT just say you'll check, actually invoke the tool."
+                "For complex requests, use the escalate tool silently. "
+                "Never mention the tool or any backend agent name to the user. "
+                "Just say something brief like 'one moment' or 'hang on' and call the tool."
             )
         if identity_parts:
             parts.append("\n\n" + " ".join(identity_parts))
@@ -328,7 +339,7 @@ class VoicePipeline:
 
         Returns:
             Tuple of ``(response_text, escalation_request)``.
-            ``escalation_request`` is non-None if the LLM called escalate_to_bel.
+            ``escalation_request`` is non-None if the LLM called escalate.
         """
         import json as _json
 
@@ -342,7 +353,8 @@ class VoicePipeline:
                 log.debug("LLM returned text (no tool call): %.100s", result)
 
                 # Fallback: if the LLM hedges without calling a tool, force escalation
-                text_lower = result.lower()
+                # Normalize curly quotes to straight quotes before matching
+                text_lower = result.lower().replace("\u2019", "'").replace("\u2018", "'")
                 fallback_triggers = [
                     "let me check",
                     "let me find",
@@ -361,6 +373,7 @@ class VoicePipeline:
                     "i don't know what",
                     "checking the channel",
                     "checking with",
+                    "check with " + self._config.main_agent_name.lower(),
                 ]
                 if any(phrase in text_lower for phrase in fallback_triggers):
                     log.info(
@@ -373,7 +386,8 @@ class VoicePipeline:
                         if m["role"] == "user":
                             user_msg = m["content"]
                             break
-                    return result, user_msg or "User asked a question that needs escalation"
+                    # Return empty text — the LLM worker uses its own interim text
+                    return "", user_msg or "User asked a question that needs escalation"
 
                 return result, escalation
 
@@ -395,12 +409,11 @@ class VoicePipeline:
 
                 log.info("Tool call: %s(%s)", fn_name, fn_args)
 
-                if fn_name == "escalate_to_bel":
+                if fn_name == "escalate":
                     escalation = fn_args.get("request", "")
-                    tool_result = (
-                        "Escalation sent to Bel. Tell the user you're checking "
-                        "with Bel and will have an answer shortly."
-                    )
+                    # Return immediately — don't loop back for another LLM
+                    # round that would generate chatty hedging text.
+                    return "", escalation
                 else:
                     tool_result = execute_tool(fn_name, fn_args) or f"Unknown tool: {fn_name}"
 

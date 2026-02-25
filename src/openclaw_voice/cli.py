@@ -412,9 +412,35 @@ def all_cmd(
 # ---------------------------------------------------------------------------
 
 
+def _load_json_config_from_stdin() -> dict:
+    """Read a JSON config blob from stdin.
+
+    Returns parsed dict or empty dict on failure.
+    """
+    import json as _json
+
+    try:
+        raw = sys.stdin.read()
+        if raw.strip():
+            return _json.loads(raw)
+    except Exception as exc:
+        log.error("Failed to parse --config-json from stdin: %s", exc)
+    return {}
+
+
 @main.command("discord-bot")
 @_config_option
 @_log_level_option
+@click.option(
+    "--config-json",
+    is_flag=True,
+    default=False,
+    help=(
+        "Read JSON config from stdin instead of (or in addition to) a TOML file. "
+        "Pass '-' as the value or use this flag and pipe JSON on stdin. "
+        "Priority: CLI flags > --config-json > --config (TOML) > defaults."
+    ),
+)
 @click.option(
     "--token",
     default=lambda: _env("DISCORD_TOKEN"),
@@ -490,6 +516,7 @@ def all_cmd(
 def discord_bot_cmd(
     config: str | None,
     log_level: str,
+    config_json: bool,
     token: str | None,
     guild_id: tuple[str, ...],
     whisper_url: str,
@@ -504,35 +531,57 @@ def discord_bot_cmd(
     vad_min_speech_ms: int,
     transcript_channel_id: str | None,
 ) -> None:
-    """Start the Discord voice channel bot."""
+    """Start the Discord voice channel bot.
+
+    Config priority (highest first):
+      1. CLI flags / environment variables
+      2. --config-json (JSON from stdin)
+      3. --config (TOML file)
+      4. Built-in defaults
+    """
     _setup_logging(log_level)
 
+    # --- Load JSON config from stdin (OpenClaw plugin path) ---
+    json_cfg: dict = {}
+    if config_json:
+        json_cfg = _load_json_config_from_stdin()
+        if not json_cfg:
+            log.warning("--config-json flag set but no JSON received on stdin")
+
+    # --- Load TOML config file (standalone / dev path) ---
     cfg_file: dict = {}
     if config:
         cfg_file = _load_toml_config(Path(config)).get("discord", {})
 
-    # Also check OpenClaw config for a [voice] section as fallback
-    if not cfg_file:
+    # Merge: json_cfg takes priority over cfg_file; both are lower than CLI flags
+    merged: dict = {**cfg_file, **json_cfg}
+
+    # Also check OpenClaw config for a [voice] section as final fallback
+    if not merged:
         openclaw_cfg = _load_openclaw_config()
         if openclaw_cfg:
-            cfg_file = openclaw_cfg
+            merged = openclaw_cfg
 
-    # Resolve token (CLI > env > config file)
-    resolved_token = token or cfg_file.get("token")
+    # Resolve token (CLI > env > JSON config > TOML config)
+    resolved_token = token or merged.get("token")
     if not resolved_token:
         import click as _click
 
         raise _click.ClickException(
-            "Discord bot token is required. Pass --token or set OPENCLAW_VOICE_DISCORD_TOKEN."
+            "Discord bot token is required. Pass --token, set OPENCLAW_VOICE_DISCORD_TOKEN,"
+            " or provide 'token' in --config-json."
         )
 
     # Resolve guild IDs
     resolved_guild_ids: list[int] = []
     if guild_id:
         resolved_guild_ids = [int(g) for g in guild_id]
-    elif cfg_file.get("guild_id"):
-        raw = cfg_file["guild_id"]
-        resolved_guild_ids = [int(raw)] if isinstance(raw, (str, int)) else [int(g) for g in raw]
+    elif merged.get("guild_ids"):
+        raw_ids = merged["guild_ids"]
+        resolved_guild_ids = [int(g) for g in raw_ids] if isinstance(raw_ids, list) else [int(raw_ids)]
+    elif merged.get("guild_id"):
+        raw_id = merged["guild_id"]
+        resolved_guild_ids = [int(raw_id)] if isinstance(raw_id, (str, int)) else [int(g) for g in raw_id]
 
     from openclaw_voice.discord_bot import (
         DEFAULT_VAD_MIN_SPEECH_MS,
@@ -542,11 +591,11 @@ def discord_bot_cmd(
     )
 
     # Config file values override CLI defaults (CLI explicit flags still win
-    # via env vars, but when --config is given, its values take precedence
-    # over hardcoded click defaults).
+    # via env vars, but when --config / --config-json is given, those values
+    # take precedence over hardcoded click defaults).
     def _resolve(cli_val, key: str, fallback=None):
-        """Config file wins over CLI default; explicit CLI/env wins over config."""
-        cfg_val = cfg_file.get(key)
+        """JSON/TOML config wins over CLI default; explicit CLI/env wins over config."""
+        cfg_val = merged.get(key)
         if cfg_val is not None:
             return cfg_val
         return cli_val if cli_val is not None else fallback
@@ -560,25 +609,34 @@ def discord_bot_cmd(
         enable_speaker_id=_resolve(speaker_id, "enable_speaker_id", False),
         speaker_id_url=_resolve(speaker_id_url, "speaker_id_url", "http://localhost:8003/identify"),
         max_history_turns=_resolve(max_history, "max_history_turns", 20),
-        # Identity & context from config file (not hardcoded)
-        bot_name=cfg_file.get("bot_name", "Assistant"),
-        main_agent_name=cfg_file.get("main_agent_name", "main agent"),
-        default_location=cfg_file.get("default_location", ""),
-        default_timezone=cfg_file.get("default_timezone", "UTC"),
-        extra_context=cfg_file.get("extra_context", ""),
-        whisper_prompt=cfg_file.get("whisper_prompt", ""),
-        corrections_file=cfg_file.get("corrections_file", ""),
+        # Identity & context from config (JSON or TOML, not hardcoded)
+        bot_name=merged.get("bot_name", "Assistant"),
+        main_agent_name=merged.get("main_agent_name", "main agent"),
+        default_location=merged.get("default_location", ""),
+        default_timezone=merged.get("default_timezone", "UTC"),
+        extra_context=merged.get("extra_context", ""),
+        whisper_prompt=merged.get("whisper_prompt", ""),
+        corrections_file=merged.get("corrections_file", ""),
+        channel_context_messages=int(merged.get("channel_context_messages", 10)),
+        tts_read_channel=bool(merged.get("tts_read_channel", True)),
     )
 
-    # Resolve VAD and transcript settings (CLI > env > config file > defaults)
+    # Resolve VAD and transcript settings (CLI > env > config > defaults)
     resolved_vad_silence_ms: int = vad_silence_ms or int(
-        cfg_file.get("vad_silence_ms", DEFAULT_VAD_SILENCE_MS)
+        merged.get("vad_silence_ms", DEFAULT_VAD_SILENCE_MS)
     )
     resolved_vad_min_speech_ms: int = vad_min_speech_ms or int(
-        cfg_file.get("vad_min_speech_ms", DEFAULT_VAD_MIN_SPEECH_MS)
+        merged.get("vad_min_speech_ms", DEFAULT_VAD_MIN_SPEECH_MS)
     )
-    raw_channel_id = transcript_channel_id or cfg_file.get("transcript_channel_id")
+    resolved_speech_end_delay_ms: int = int(merged.get("speech_end_delay_ms", 1000))
+    raw_channel_id = transcript_channel_id or merged.get("transcript_channel_id")
     resolved_transcript_channel_id: int | None = int(raw_channel_id) if raw_channel_id else None
+
+    # Resolve HTTP control server port and gateway port (plugin mode)
+    resolved_control_port: int = int(merged.get("control_port", 18790))
+    resolved_gateway_port: int | None = (
+        int(merged["gateway_port"]) if merged.get("gateway_port") else None
+    )
 
     bot = create_bot(
         pipeline_config=pipeline_config,
@@ -586,6 +644,9 @@ def discord_bot_cmd(
         transcript_channel_id=resolved_transcript_channel_id,
         vad_silence_ms=resolved_vad_silence_ms,
         vad_min_speech_ms=resolved_vad_min_speech_ms,
+        speech_end_delay_ms=resolved_speech_end_delay_ms,
+        control_port=resolved_control_port,
+        gateway_port=resolved_gateway_port,
     )
 
     log.info(
@@ -596,7 +657,10 @@ def discord_bot_cmd(
             "tts_voice": pipeline_config.tts_voice,
             "vad_silence_ms": resolved_vad_silence_ms,
             "vad_min_speech_ms": resolved_vad_min_speech_ms,
+            "speech_end_delay_ms": resolved_speech_end_delay_ms,
             "transcript_channel_id": resolved_transcript_channel_id,
+            "control_port": resolved_control_port,
+            "gateway_port": resolved_gateway_port,
         },
     )
 

@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import contextlib
+import json
 import logging
 import tempfile
 import time
@@ -71,6 +72,9 @@ DEFAULT_VAD_MIN_SPEECH_MS = 500
 ESCALATION_KEEPALIVE_S = 20
 ESCALATION_MAX_WAIT_S = 120
 
+_VOICE_STATE_FILE = Path.home() / ".openclaw" / "workspace" / "openclaw-voice" / "voice_state.json"
+_PID_FILE = Path.home() / ".openclaw" / "workspace" / "openclaw-voice" / "chip.pid"
+
 
 # ---------------------------------------------------------------------------
 # VAD Sink (pycord voice receive)
@@ -108,6 +112,7 @@ class VoiceSink(Sink):  # type: ignore[misc]
         vad_min_speech_ms: int = DEFAULT_VAD_MIN_SPEECH_MS,
         bot_user_id: int = 0,
         pre_buffer_ms: int = DEFAULT_PRE_BUFFER_MS,
+        speech_end_delay_ms: int = 1000,
         *args,
         **kwargs,
     ) -> None:
@@ -131,7 +136,7 @@ class VoiceSink(Sink):  # type: ignore[misc]
         # Per-user debounce timer handles (asyncio.TimerHandle)
         self._flush_timers: dict[int, asyncio.TimerHandle] = {}
         # Debounce delay: flush this many seconds after last packet
-        self._flush_delay_s = 0.25
+        self._flush_delay_s = speech_end_delay_ms / 1000.0
         # Keep _vad_instances for mute-detection compatibility
         self._vad_instances: dict[int, VoiceActivityDetector] = {}
 
@@ -296,6 +301,9 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
         transcript_channel_id: int | None = None,
         vad_silence_ms: int = DEFAULT_VAD_SILENCE_MS,
         vad_min_speech_ms: int = DEFAULT_VAD_MIN_SPEECH_MS,
+        speech_end_delay_ms: int = 1000,
+        control_port: int = 18790,
+        gateway_port: int | None = None,
         **kwargs,
     ) -> None:
         if not _PYCORD_AVAILABLE:
@@ -314,6 +322,13 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
         self._guild_context: dict[int, dict] = {}  # guild_id → {guild_name, channel, etc.}
         self._vad_silence_ms = vad_silence_ms
         self._vad_min_speech_ms = vad_min_speech_ms
+        self._speech_end_delay_ms = speech_end_delay_ms
+
+        # HTTP control server settings (plugin mode)
+        self._control_port = control_port
+        self._gateway_port = gateway_port  # OpenClaw gateway port for escalation
+        self._control_server_task: asyncio.Task | None = None  # type: ignore[type-arg]
+        self._start_time = time.monotonic()
 
         # Per-guild voice pipelines (one per active voice channel)
         self._pipelines: dict[int, VoicePipeline] = {}
@@ -334,7 +349,256 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
     # ------------------------------------------------------------------
 
     async def on_ready(self) -> None:
+        # Kill any previous instance and write our PID
+        self._claim_pid_file()
+        # Build cast of characters for all guilds
+        await self._build_cast()
         log.info("VoiceBot ready", extra={"user": str(self.user)})
+        await self._restore_voice_state()
+        # Start the HTTP control/health server (for plugin agent tools + health checks)
+        self._control_server_task = asyncio.create_task(self._run_control_server())
+
+    # ------------------------------------------------------------------
+    # Cast of characters — built on startup for fast message handling
+    # ------------------------------------------------------------------
+
+    # Roles for on_message routing:
+    #   "self"   — this bot (Chip), skip entirely
+    #   "agent"  — main agent bot (belthanior/Bel), skip in bridge (handled by escalation TTS)
+    #   "bot"    — other bots, identify by name in TTS bridge
+    #   "user"   — human users, skip if in voice channel, otherwise identify
+    _cast: dict[int, dict] = {}  # user_id → {"name": str, "role": str}
+
+    async def _build_cast(self) -> None:
+        """Build a lookup of all members and bots across guilds."""
+        main_name = self._pipeline_config.main_agent_name.lower()
+        self_id = self.user.id
+
+        for guild in self.guilds:
+            # Fetch full member list (works even without members intent for small guilds)
+            try:
+                members = guild.members
+                if not members or len(members) < 2:
+                    # Cache might be empty — try fetching
+                    members = []
+                    async for member in guild.fetch_members(limit=200):
+                        members.append(member)
+            except Exception as exc:
+                log.warning("Failed to fetch members for guild %s: %s", guild.id, exc)
+                members = guild.members or []
+
+            for member in members:
+                if member.id == self_id:
+                    role = "self"
+                elif member.bot:
+                    name_lower = (member.display_name or member.name).lower()
+                    if name_lower in (main_name, "belthanior", "bel"):
+                        role = "agent"
+                    else:
+                        role = "bot"
+                else:
+                    role = "user"
+
+                self._cast[member.id] = {
+                    "name": member.display_name or member.name,
+                    "role": role,
+                }
+
+            log.info(
+                "Cast of characters for guild %s: %d members (%d users, %d bots, agent=%s)",
+                guild.name,
+                len(members),
+                sum(1 for v in self._cast.values() if v["role"] == "user"),
+                sum(1 for v in self._cast.values() if v["role"] in ("bot", "agent", "self")),
+                next((v["name"] for v in self._cast.values() if v["role"] == "agent"), "none"),
+            )
+
+    def _cast_lookup(self, user_id: int) -> dict:
+        """Look up a user in the cast. Returns {"name": str, "role": str}."""
+        return self._cast.get(user_id, {"name": str(user_id), "role": "unknown"})
+
+    @staticmethod
+    def _claim_pid_file() -> None:
+        """Write our PID and kill any stale previous instance."""
+        import os
+        import signal
+
+        if _PID_FILE.is_file():
+            try:
+                old_pid = int(_PID_FILE.read_text().strip())
+                if old_pid != os.getpid():
+                    os.kill(old_pid, signal.SIGTERM)
+                    log.info("Killed previous instance (PID %d)", old_pid)
+            except (ValueError, ProcessLookupError, PermissionError):
+                pass
+        _PID_FILE.write_text(str(os.getpid()))
+
+    async def _restore_voice_state(self) -> None:
+        """Auto-reconnect to the last voice channel on restart."""
+        if not _VOICE_STATE_FILE.is_file():
+            return
+        try:
+            state = json.loads(_VOICE_STATE_FILE.read_text())
+            guild_id = state["guild_id"]
+            voice_channel_id = state["voice_channel_id"]
+            text_channel_id = state["text_channel_id"]
+
+            guild = self.get_guild(guild_id)
+            if guild is None:
+                log.warning("Restore voice state: guild %s not found", guild_id)
+                return
+
+            channel = guild.get_channel(voice_channel_id)
+            if channel is None:
+                log.warning("Restore voice state: voice channel %s not found", voice_channel_id)
+                return
+
+            vc = await channel.connect()
+            self._guild_text_channels[guild_id] = text_channel_id
+            await self._start_listening(guild_id, vc)
+            log.info(
+                "Restored voice connection",
+                extra={"guild_id": guild_id, "channel": channel.name},
+            )
+        except Exception as exc:
+            log.warning("Failed to restore voice state: %s", exc)
+
+    # ------------------------------------------------------------------
+    # HTTP control + health server (plugin mode)
+    # ------------------------------------------------------------------
+
+    async def _run_control_server(self) -> None:
+        """Lightweight aiohttp HTTP server for plugin ↔ bot communication.
+
+        Endpoints:
+            GET  /health           — status, active guilds, uptime
+            POST /control/join     — join a voice channel
+            POST /control/leave    — leave a voice channel
+            POST /control/speak    — synthesize and play text
+        """
+        try:
+            import aiohttp
+            from aiohttp import web
+        except ImportError:
+            log.warning(
+                "aiohttp not available — HTTP control server disabled. "
+                "Install with: pip install aiohttp"
+            )
+            return
+
+        routes = web.RouteTableDef()
+
+        @routes.get("/health")
+        async def health(_request: web.Request) -> web.Response:
+            active_guilds = list(self._sessions.keys())
+            return web.json_response({
+                "status": "ok",
+                "guilds": active_guilds,
+                "uptime": time.monotonic() - self._start_time,
+                "gateway_port": self._gateway_port,
+            })
+
+        @routes.post("/control/join")
+        async def control_join(request: web.Request) -> web.Response:
+            try:
+                data = await request.json()
+                guild_id = int(data.get("guild_id", 0))
+                channel_id = int(data.get("channel_id", 0))
+            except Exception as exc:
+                return web.json_response({"error": str(exc)}, status=400)
+
+            guild = self.get_guild(guild_id)
+            if guild is None:
+                return web.json_response({"error": f"Guild {guild_id} not found"}, status=404)
+
+            channel = guild.get_channel(channel_id)
+            if channel is None:
+                return web.json_response({"error": f"Channel {channel_id} not found"}, status=404)
+
+            if not hasattr(channel, "connect"):
+                return web.json_response({"error": "Not a voice channel"}, status=400)
+
+            try:
+                vc = await channel.connect()
+                await self._start_listening(guild_id, vc)
+                return web.json_response({"status": "joined", "channel": channel.name})
+            except Exception as exc:
+                return web.json_response({"error": str(exc)}, status=500)
+
+        @routes.post("/control/leave")
+        async def control_leave(request: web.Request) -> web.Response:
+            try:
+                data = await request.json()
+                guild_id = int(data.get("guild_id", 0))
+            except Exception as exc:
+                return web.json_response({"error": str(exc)}, status=400)
+
+            guild = self.get_guild(guild_id)
+            if guild is None:
+                return web.json_response({"error": f"Guild {guild_id} not found"}, status=404)
+
+            vc = guild.voice_client
+            if vc is None:
+                return web.json_response({"status": "not_connected"})
+
+            try:
+                await vc.disconnect()
+                return web.json_response({"status": "left"})
+            except Exception as exc:
+                return web.json_response({"error": str(exc)}, status=500)
+
+        @routes.post("/control/speak")
+        async def control_speak(request: web.Request) -> web.Response:
+            try:
+                data = await request.json()
+                guild_id = int(data.get("guild_id", 0))
+                text = str(data.get("text", ""))
+            except Exception as exc:
+                return web.json_response({"error": str(exc)}, status=400)
+
+            if not text:
+                return web.json_response({"error": "text is required"}, status=400)
+
+            pipeline = self._pipelines.get(guild_id)
+            session = self._sessions.get(guild_id)
+            if pipeline is None or session is None:
+                return web.json_response({"error": "Not connected in guild"}, status=404)
+
+            # Synthesize and queue for playback (non-blocking)
+            import concurrent.futures
+
+            loop = asyncio.get_event_loop()
+            try:
+                wav_bytes = await loop.run_in_executor(
+                    None, pipeline.synthesize_response, text
+                )
+                if wav_bytes:
+                    session.playback_queue.put_nowait((wav_bytes, None))
+                    return web.json_response({"status": "queued", "bytes": len(wav_bytes)})
+                else:
+                    return web.json_response({"error": "TTS synthesis failed"}, status=500)
+            except Exception as exc:
+                return web.json_response({"error": str(exc)}, status=500)
+
+        app = web.Application()
+        app.add_routes(routes)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", self._control_port)
+        try:
+            await site.start()
+            log.info(
+                "HTTP control server listening",
+                extra={"port": self._control_port},
+            )
+            # Keep running until cancelled
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            pass
+        except OSError as exc:
+            log.error("HTTP control server failed to start on port %d: %s", self._control_port, exc)
+        finally:
+            await runner.cleanup()
 
     async def on_voice_state_update(
         self,
@@ -369,6 +633,116 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
                         await session.stt_queue.put(
                             (uid_int, utterance, time.monotonic(), sink._user_seqs[uid_int])
                         )
+
+    async def on_message(self, message: discord.Message) -> None:
+        """Bridge text channel messages to voice TTS using the cast of characters.
+
+        Routing by role:
+          "self"    → skip (Chip's own messages)
+          "agent"   → skip (Bel's posts — already handled by escalation TTS)
+          "user"    → skip if in voice channel, otherwise read aloud with attribution
+          "bot"     → read aloud with attribution
+          "unknown" → read aloud with attribution (new member not in startup cast)
+        """
+        if not message.guild:
+            return
+
+        guild_id = message.guild.id
+        session = self._sessions.get(guild_id)
+        if session is None:
+            return
+
+        # Must match the linked text channel
+        text_channel_id = self._guild_text_channels.get(guild_id)
+        if not text_channel_id or message.channel.id != text_channel_id:
+            return
+
+        # Look up in cast
+        cast_entry = self._cast_lookup(message.author.id)
+        role = cast_entry["role"]
+        display_name = cast_entry["name"]
+
+        # If not in cast yet (joined after startup), add them now
+        if role == "unknown":
+            display_name = message.author.display_name or message.author.name
+            if message.author.bot:
+                # Check if this is the main agent
+                name_lower = display_name.lower()
+                main_name = self._pipeline_config.main_agent_name.lower()
+                if name_lower in (main_name, "belthanior", "bel"):
+                    role = "agent"
+                else:
+                    role = "bot"
+            else:
+                role = "user"
+            self._cast[message.author.id] = {"name": display_name, "role": role}
+            log.info("Added to cast: %s (id=%d, role=%s)", display_name, message.author.id, role)
+
+        # Route by role
+        if role == "self":
+            return
+        if role == "agent":
+            log.debug("on_message: skipping agent message from %s", display_name)
+            return
+
+        # Users in voice can hear themselves type — skip
+        if role == "user":
+            vc = message.guild.voice_client if message.guild else None
+            if vc and vc.channel:
+                voice_member_ids = {m.id for m in vc.channel.members}
+                if message.author.id in voice_member_ids:
+                    log.debug("on_message: skipping — %s is in voice channel", display_name)
+                    return
+
+        content = message.content.strip()
+        if not content:
+            return
+
+        pipeline = self._pipelines.get(guild_id)
+        if pipeline is None or not pipeline.config.tts_read_channel:
+            return
+
+        loop = asyncio.get_event_loop()
+        word_count = len(content.split())
+
+        # Summarize long messages via LLM so TTS stays concise
+        if word_count > 250:
+            try:
+                summary_messages = [
+                    {
+                        "role": "system",
+                        "content": (
+                            "Summarize the following message in 2 sentences. "
+                            "Be concise and factual. /no_think"
+                        ),
+                    },
+                    {"role": "user", "content": content},
+                ]
+                summary = await loop.run_in_executor(
+                    None, pipeline._call_openai_compat, summary_messages
+                )
+                if summary and isinstance(summary, str):
+                    content = summary.strip()
+                else:
+                    content = " ".join(content.split()[:250]) + "…"
+            except Exception as exc:
+                log.warning("Failed to summarize channel message: %s", exc)
+                content = " ".join(content.split()[:250]) + "…"
+
+        # Attribution: other speakers get identified, self/agent never reach here
+        tts_text = f"{display_name} says: {content}"
+
+        log.info(
+            "Text-to-voice bridge: reading message",
+            extra={"guild_id": guild_id, "author": display_name, "role": role, "words": word_count},
+        )
+
+        audio = await loop.run_in_executor(
+            None, pipeline.synthesize_response, tts_text
+        )
+        if audio:
+            with contextlib.suppress(asyncio.QueueFull):
+                session.playback_queue.put_nowait((audio, None))
 
     # ------------------------------------------------------------------
     # Slash commands
@@ -429,6 +803,16 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
         # Remember the text channel where /join was invoked for transcripts
         self._guild_text_channels[guild_id] = ctx.channel_id
 
+        # Persist voice state for auto-reconnect on restart
+        try:
+            _VOICE_STATE_FILE.write_text(json.dumps({
+                "guild_id": guild_id,
+                "voice_channel_id": channel.id,
+                "text_channel_id": ctx.channel_id,
+            }))
+        except Exception as exc:
+            log.warning("Failed to save voice state: %s", exc)
+
         await self._start_listening(guild_id, vc)
         await ctx.respond(f"Joined **{channel.name}**. I'm listening! 🎙️")
         log.info(
@@ -448,6 +832,12 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
         await self._stop_listening(guild_id)
         self._guild_text_channels.pop(guild_id, None)
         self._guild_context.pop(guild_id, None)
+
+        # Clear persisted voice state
+        try:
+            _VOICE_STATE_FILE.unlink(missing_ok=True)
+        except Exception as exc:
+            log.warning("Failed to clear voice state: %s", exc)
         await vc.disconnect(force=True)
         await ctx.respond("Disconnected. Bye! 👋")
         log.info("Disconnected from voice channel", extra={"guild_id": guild_id})
@@ -489,11 +879,15 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
         channel_name = voice_channel.name if voice_channel else "unknown"
 
         # Store context for escalation messages
+        text_channel_id = self._guild_text_channels.get(guild_id)
+        text_channel_obj = self.get_channel(text_channel_id) if text_channel_id else None
+        text_channel_name = getattr(text_channel_obj, "name", None) or "unknown"
         self._guild_context[guild_id] = {
             "guild_name": guild_name,
             "guild_id": guild_id,
             "voice_channel": channel_name,
-            "text_channel_id": self._guild_text_channels.get(guild_id),
+            "text_channel_id": text_channel_id,
+            "text_channel_name": text_channel_name,
         }
 
         # Load channel memory (from the text channel where /join was invoked)
@@ -508,7 +902,7 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
 
         # Build system prompt with channel context injected
         system_prompt = pipeline.build_system_prompt()
-        context_addition = f"\n\nYou are in the '{channel_name}' voice channel on the '{guild_name}' Discord server."
+        context_addition = f"\n\nYou are in the '{channel_name}' voice channel on the '{guild_name}' Discord server. The linked text channel is #{text_channel_name}."
         if channel_memory:
             summary = channel_memory[-1500:] if len(channel_memory) > 1500 else channel_memory
             context_addition += f"\n\nRecent channel context:\n{summary}"
@@ -534,6 +928,7 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
             vad_silence_ms=self._vad_silence_ms,
             vad_min_speech_ms=self._vad_min_speech_ms,
             bot_user_id=self.user.id,
+            speech_end_delay_ms=self._speech_end_delay_ms,
         )
         self._sinks[guild_id] = sink
         vc.start_recording(sink, self._on_recording_finished, guild_id)
@@ -611,7 +1006,14 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
                     extra={"guild_id": guild_id, "user_id": user_id, "seq": seq},
                 )
 
-                display_name = self._resolve_display_name(guild_id, user_id)
+                # Use cast first, fall back to async resolution
+                cast_entry = self._cast_lookup(int(user_id))
+                if cast_entry["role"] != "unknown":
+                    display_name = cast_entry["name"]
+                else:
+                    display_name = await self._resolve_display_name_async(guild_id, user_id)
+                    # Cache in cast for next time
+                    self._cast[int(user_id)] = {"name": display_name, "role": "user"}
 
                 # Transcribe in executor (blocking Whisper HTTP call)
                 transcript = await loop.run_in_executor(
@@ -681,8 +1083,41 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
                 # Snapshot log version before the LLM call
                 _, pre_version = session.log.snapshot()
 
+                # Inject recent text channel messages into the system prompt
+                system_content = session.system_prompt
+                n_ctx = pipeline.config.channel_context_messages
+                if n_ctx > 0:
+                    text_channel_id = self._guild_text_channels.get(guild_id)
+                    if text_channel_id:
+                        try:
+                            text_channel = self.get_channel(text_channel_id)
+                            if text_channel:
+                                ctx_lines: list[str] = []
+                                async for msg in text_channel.history(limit=n_ctx):
+                                    if msg.author.id == self.user.id:
+                                        continue
+                                    if msg.content:
+                                        ctx_lines.append(
+                                            f"{msg.author.display_name}: {msg.content}"
+                                        )
+                                ctx_lines.reverse()  # chronological order
+                                if ctx_lines:
+                                    ch_name = getattr(text_channel, "name", str(text_channel_id))
+                                    header = f"[Text channel #{ch_name} — last {len(ctx_lines)} messages]"
+                                    system_content = (
+                                        session.system_prompt
+                                        + f"\n\n{header}\n"
+                                        + "\n".join(ctx_lines)
+                                    )
+                        except Exception as _ctx_exc:
+                            log.warning(
+                                "Failed to fetch channel context for guild %s: %s",
+                                guild_id,
+                                _ctx_exc,
+                            )
+
                 # Build message list: system prompt + full conversation history
-                messages = [{"role": "system", "content": session.system_prompt}]
+                messages = [{"role": "system", "content": system_content}]
                 messages += session.log.to_messages()
 
                 log.debug(
@@ -725,7 +1160,7 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
 
                 # Handle escalation tool call
                 if escalation:
-                    interim_text = f"Let me check with {agent_name} on that."
+                    interim_text = "One moment."
                     entry = LogEntry(
                         ts=time.monotonic(),
                         kind="assistant",
@@ -733,11 +1168,8 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
                         text=interim_text,
                     )
                     session.log.append(entry)
+                    session._pending_channel_post = f"🫖 **{bot_name}**: {interim_text}"
                     session.pending_tts.set()
-
-                    await self._post_to_channel(
-                        guild_id, f"🫖 **{bot_name}**: {interim_text}"
-                    )
 
                     # Spawn escalation worker as independent task
                     esc_id = f"esc-{time.monotonic():.3f}"
@@ -769,11 +1201,10 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
                     text=response_text,
                 )
                 session.log.append(entry)
+                # Store the channel post text on the session so playback worker
+                # can post AFTER audio plays (not before)
+                session._pending_channel_post = f"🫖 **{bot_name}**: {response_text}"
                 session.pending_tts.set()
-
-                await self._post_to_channel(
-                    guild_id, f"🫖 **{bot_name}**: {response_text}"
-                )
 
         except asyncio.CancelledError:
             log.debug("LLM worker cancelled for guild %s", guild_id)
@@ -830,9 +1261,12 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
                     log.warning("TTS returned empty audio for guild %s", guild_id)
                     continue
 
-                # Queue for playback
+                # Queue for playback — tuple of (audio, channel_post_text)
+                # Channel post text is posted AFTER playback completes
+                channel_post = getattr(session, "_pending_channel_post", None)
+                session._pending_channel_post = None
                 try:
-                    session.playback_queue.put_nowait(audio)
+                    session.playback_queue.put_nowait((audio, channel_post))
                 except asyncio.QueueFull:
                     log.warning(
                         "Playback queue full for guild %s, dropping TTS audio", guild_id
@@ -882,6 +1316,13 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
                 timeout=ESCALATION_MAX_WAIT_S,
             )
 
+            # Filter non-answers (NO_REPLY, bare "NO", etc.)
+            if bel_response:
+                stripped = bel_response.strip().upper()
+                if stripped in ("NO_REPLY", "NO", "NOREPLY", "N/A", ""):
+                    log.warning("Escalation returned non-answer: %r — treating as empty", bel_response)
+                    bel_response = None
+
             if not bel_response:
                 fail_text = f"Sorry, I couldn't reach {agent_name}."
                 audio = await loop.run_in_executor(
@@ -889,7 +1330,7 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
                 )
                 if audio:
                     with contextlib.suppress(asyncio.QueueFull):
-                        session.playback_queue.put_nowait(audio)
+                        session.playback_queue.put_nowait((audio, None))
                 session.log.append(
                     LogEntry(
                         ts=time.monotonic(),
@@ -929,7 +1370,7 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
             )
             if audio:
                 with contextlib.suppress(asyncio.QueueFull):
-                    session.playback_queue.put_nowait(audio)
+                    session.playback_queue.put_nowait((audio, None))
 
         except asyncio.TimeoutError:
             log.warning("Escalation timed out for guild %s", guild_id)
@@ -939,7 +1380,7 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
             )
             if audio:
                 with contextlib.suppress(asyncio.QueueFull):
-                    session.playback_queue.put_nowait(audio)
+                    session.playback_queue.put_nowait((audio, None))
         except asyncio.CancelledError:
             log.debug("Escalation worker cancelled for guild %s", guild_id)
         except Exception as exc:
@@ -948,12 +1389,14 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
             )
 
     async def _send_to_bel(self, request: str, user_name: str, guild_id: int = 0) -> str | None:
-        """Send a request to Bel via the OpenClaw gateway WebSocket.
+        """Send a request to the main agent (Bel) for escalation.
 
-        Returns Bel's response text, or None on failure/timeout.
+        When ``gateway_port`` is configured (plugin mode), uses the lightweight
+        HTTP escalation client. Falls back to the legacy WebSocket gateway
+        client in standalone mode.
+
+        Returns the agent's response text, or None on failure/timeout.
         """
-        from openclaw_voice.gateway_client import send_to_bel
-
         bot_name = self._pipeline_config.bot_name
         agent_name = self._pipeline_config.main_agent_name
 
@@ -962,6 +1405,7 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
         guild_name = ctx.get("guild_name", "unknown server")
         voice_channel = ctx.get("voice_channel", "unknown channel")
         text_channel_id = ctx.get("text_channel_id")
+        text_channel_name = ctx.get("text_channel_name", "unknown")
 
         context_parts = [
             f"[Voice escalation from {bot_name}]",
@@ -969,17 +1413,44 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
             f"Voice channel: {voice_channel}",
         ]
         if text_channel_id:
-            context_parts.append(f"Text channel ID: {text_channel_id}")
+            context_parts.append(f"Text channel: #{text_channel_name} (ID: {text_channel_id})")
+
+        instructions = (
+            "Your response will be spoken aloud via TTS — keep it SHORT "
+            "(1-3 sentences), no markdown, no links, no code blocks.\n"
+            "Do NOT say NO_REPLY — always respond with text for the voice user."
+        )
+        if text_channel_id:
+            instructions += (
+                f"\nAlso post your full response as a Discord message to "
+                f"#{text_channel_name} (channel ID {text_channel_id}) so text participants can read it."
+            )
 
         message = (
             f"{' | '.join(context_parts)}\n"
             f"{user_name} asked via voice: {request}\n\n"
             f"INSTRUCTIONS:\n"
-            f"Your response will be spoken aloud via TTS — keep it SHORT "
-            f"(1-3 sentences), no markdown, no links, no code blocks.\n"
-            f"Do NOT say NO_REPLY — always respond with text for the voice user."
+            f"{instructions}"
         )
-        return await send_to_bel(message, timeout_s=90.0)
+
+        if self._gateway_port is not None:
+            # Plugin mode — use HTTP escalation client (simple, no WebSocket protocol)
+            from openclaw_voice.escalation_http import escalate  # noqa: PLC0415
+
+            channel_id_for_session = ctx.get("text_channel_id") or 0
+            return await escalate(
+                message=message,
+                guild_id=guild_id,
+                channel_id=int(channel_id_for_session),
+                user_id=0,  # voice users don't have a specific user ID in this context
+                gateway_port=self._gateway_port,
+                timeout_s=90.0,
+            )
+        else:
+            # Standalone mode — use WebSocket gateway client
+            from openclaw_voice.gateway_client import send_to_bel  # noqa: PLC0415
+
+            return await send_to_bel(message, timeout_s=90.0)
 
     # ------------------------------------------------------------------
     # Playback worker
@@ -996,10 +1467,22 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
 
         while True:
             try:
-                wav_bytes = await session.playback_queue.get()
+                item = await session.playback_queue.get()
+
+                # Unpack tuple: (audio_bytes, channel_post_text_or_none)
+                if isinstance(item, tuple):
+                    wav_bytes, channel_post = item
+                else:
+                    wav_bytes, channel_post = item, None
 
                 if not vc.is_connected():
                     log.debug("Voice client disconnected, dropping playback")
+                    session.playback_queue.task_done()
+                    continue
+
+                # Check barge-in before even starting
+                if session.tts_cancel.is_set():
+                    log.info("Playback skipped — user is speaking (barge-in)")
                     session.playback_queue.task_done()
                     continue
 
@@ -1008,17 +1491,46 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
                     tf.write(wav_bytes)
                     tmp_path = tf.name
 
+                barged_in = False
                 try:
                     # Wait for any current playback to finish
                     while vc.is_playing():
-                        await asyncio.sleep(0.1)
+                        if session.tts_cancel.is_set():
+                            vc.stop()
+                            log.info("Barge-in: stopped current playback")
+                            barged_in = True
+                            break
+                        await asyncio.sleep(0.05)
+
+                    if barged_in or session.tts_cancel.is_set():
+                        # Drain remaining queue — user interrupted
+                        drained = 0
+                        while not session.playback_queue.empty():
+                            try:
+                                session.playback_queue.get_nowait()
+                                session.playback_queue.task_done()
+                                drained += 1
+                            except asyncio.QueueEmpty:
+                                break
+                        if drained:
+                            log.info("Barge-in: drained %d queued audio chunks", drained)
+                        continue
 
                     source = discord.FFmpegPCMAudio(tmp_path)
                     vc.play(source)
 
-                    # Wait for playback to complete
+                    # Wait for playback to complete, checking barge-in
                     while vc.is_playing():
-                        await asyncio.sleep(0.1)
+                        if session.tts_cancel.is_set():
+                            vc.stop()
+                            log.info("Barge-in: interrupted playback mid-stream")
+                            barged_in = True
+                            break
+                        await asyncio.sleep(0.05)
+
+                    # Post to channel AFTER successful playback (not before)
+                    if not barged_in and channel_post:
+                        await self._post_to_channel(guild_id, channel_post)
 
                 except Exception as exc:
                     log.error("Playback error for guild %s: %s", guild_id, exc)
@@ -1037,15 +1549,47 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
     # Helpers
     # ------------------------------------------------------------------
 
+    # Cache for resolved display names (user_id → name)
+    _name_cache: dict[int, str] = {}
+
     def _resolve_display_name(self, guild_id: int, user_id: int | str) -> str:
-        """Resolve a Discord user ID to their display name."""
+        """Resolve a Discord user ID to their display name (sync, cache-only)."""
         uid = int(user_id)
+        if uid in self._name_cache:
+            return self._name_cache[uid]
         try:
             guild = self.get_guild(guild_id)
             if guild:
                 member = guild.get_member(uid)
                 if member:
+                    self._name_cache[uid] = member.display_name
                     return member.display_name
+        except Exception:
+            pass
+        return str(user_id)
+
+    async def _resolve_display_name_async(self, guild_id: int, user_id: int | str) -> str:
+        """Resolve a Discord user ID to their display name with API fallback."""
+        uid = int(user_id)
+        # Check cache first
+        if uid in self._name_cache:
+            return self._name_cache[uid]
+        # Try local cache
+        try:
+            guild = self.get_guild(guild_id)
+            if guild:
+                member = guild.get_member(uid)
+                if member:
+                    self._name_cache[uid] = member.display_name
+                    return member.display_name
+                # Cache miss — fetch from API
+                try:
+                    member = await guild.fetch_member(uid)
+                    if member:
+                        self._name_cache[uid] = member.display_name
+                        return member.display_name
+                except Exception:
+                    pass
         except Exception:
             pass
         return str(user_id)
@@ -1130,6 +1674,9 @@ def create_bot(
     transcript_channel_id: int | None = None,
     vad_silence_ms: int = DEFAULT_VAD_SILENCE_MS,
     vad_min_speech_ms: int = DEFAULT_VAD_MIN_SPEECH_MS,
+    speech_end_delay_ms: int = 1000,
+    control_port: int = 18790,
+    gateway_port: int | None = None,
 ) -> VoiceBot:
     """Create a configured VoiceBot instance.
 
@@ -1139,6 +1686,9 @@ def create_bot(
         transcript_channel_id: Discord channel ID for transcript posting. None to disable.
         vad_silence_ms:       VAD silence threshold in ms (default 1500).
         vad_min_speech_ms:    VAD minimum speech duration in ms (default 500).
+        speech_end_delay_ms:  Silence duration before finalizing speech (default 1000).
+        control_port:         HTTP port for the control/health server (default 18790).
+        gateway_port:         OpenClaw gateway HTTP port for plugin escalation. None = standalone.
 
     Returns:
         Configured VoiceBot ready to run.
@@ -1148,6 +1698,12 @@ def create_bot(
 
     intents = discord.Intents.default()
     intents.voice_states = True
+    intents.members = True
+    # Message Content is a privileged intent — must be enabled in Discord
+    # Developer Portal. Only request it if tts_read_channel is enabled.
+    if pipeline_config and pipeline_config.tts_read_channel:
+        intents.message_content = True
+        intents.messages = True
 
     return VoiceBot(
         pipeline_config=pipeline_config,
@@ -1155,5 +1711,8 @@ def create_bot(
         transcript_channel_id=transcript_channel_id,
         vad_silence_ms=vad_silence_ms,
         vad_min_speech_ms=vad_min_speech_ms,
+        speech_end_delay_ms=speech_end_delay_ms,
+        control_port=control_port,
+        gateway_port=gateway_port,
         intents=intents,
     )

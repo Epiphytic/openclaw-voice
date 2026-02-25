@@ -52,3 +52,5 @@ logs/
 *.bin
 *.pt
 *.gguf
+chip.pid
+plugin/node_modules/

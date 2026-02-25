@@ -35,6 +35,8 @@ from typing import Any
 
 import httpx
 
+from openclaw_voice.facades.kokoro import KokoroFacade
+
 from wyoming.audio import AudioChunk, AudioStart, AudioStop
 from wyoming.event import Event
 from wyoming.info import Attribution, Describe, Info, TtsProgram, TtsVoice
@@ -183,60 +185,54 @@ class KokoroEventHandler(AsyncEventHandler):
             kokoro_voice,
         )
 
-        payload = {
-            "model": "kokoro",
-            "input": text.strip(),
-            "voice": kokoro_voice,
-            "response_format": self.config.response_format,
-            "speed": self.config.speed,
-        }
+        facade = KokoroFacade(url=self.config.kokoro_url, timeout=self.config.http_timeout)
 
         try:
-            async with httpx.AsyncClient(timeout=self.config.http_timeout) as client:
-                async with client.stream("POST", self.config.kokoro_url, json=payload) as resp:
-                    resp.raise_for_status()
+            # Send AudioStart before chunks
+            await self.write_event(
+                AudioStart(
+                    rate=KOKORO_SAMPLE_RATE,
+                    width=KOKORO_SAMPLE_WIDTH,
+                    channels=KOKORO_CHANNELS,
+                ).event()
+            )
 
-                    # Send AudioStart before chunks
+            total_bytes = 0
+            buffer = bytearray()
+            async for raw_chunk in facade.stream_audio(
+                text,
+                kokoro_voice,
+                response_format=self.config.response_format,
+                speed=self.config.speed,
+            ):
+                buffer.extend(raw_chunk)
+                # Emit complete AUDIO_CHUNK_SIZE blocks
+                while len(buffer) >= AUDIO_CHUNK_SIZE:
+                    block = bytes(buffer[:AUDIO_CHUNK_SIZE])
+                    buffer = buffer[AUDIO_CHUNK_SIZE:]
+                    total_bytes += len(block)
                     await self.write_event(
-                        AudioStart(
+                        AudioChunk(
+                            audio=block,
                             rate=KOKORO_SAMPLE_RATE,
                             width=KOKORO_SAMPLE_WIDTH,
                             channels=KOKORO_CHANNELS,
                         ).event()
                     )
 
-                    # Stream audio chunks
-                    total_bytes = 0
-                    buffer = bytearray()
-                    async for chunk in resp.aiter_bytes(chunk_size=4096):
-                        buffer.extend(chunk)
-                        # Emit complete AUDIO_CHUNK_SIZE blocks
-                        while len(buffer) >= AUDIO_CHUNK_SIZE:
-                            block = bytes(buffer[:AUDIO_CHUNK_SIZE])
-                            buffer = buffer[AUDIO_CHUNK_SIZE:]
-                            total_bytes += len(block)
-                            await self.write_event(
-                                AudioChunk(
-                                    audio=block,
-                                    rate=KOKORO_SAMPLE_RATE,
-                                    width=KOKORO_SAMPLE_WIDTH,
-                                    channels=KOKORO_CHANNELS,
-                                ).event()
-                            )
+            # Flush any remaining bytes
+            if buffer:
+                total_bytes += len(buffer)
+                await self.write_event(
+                    AudioChunk(
+                        audio=bytes(buffer),
+                        rate=KOKORO_SAMPLE_RATE,
+                        width=KOKORO_SAMPLE_WIDTH,
+                        channels=KOKORO_CHANNELS,
+                    ).event()
+                )
 
-                    # Flush any remaining bytes
-                    if buffer:
-                        total_bytes += len(buffer)
-                        await self.write_event(
-                            AudioChunk(
-                                audio=bytes(buffer),
-                                rate=KOKORO_SAMPLE_RATE,
-                                width=KOKORO_SAMPLE_WIDTH,
-                                channels=KOKORO_CHANNELS,
-                            ).event()
-                        )
-
-                    log.info("Streamed %d bytes of audio for synthesis", total_bytes)
+            log.info("Streamed %d bytes of audio for synthesis", total_bytes)
 
         except httpx.HTTPStatusError as exc:
             log.error(

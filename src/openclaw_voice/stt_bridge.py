@@ -41,6 +41,8 @@ from typing import Any
 
 import httpx
 
+from openclaw_voice.facades.whisper import WhisperFacade
+
 from wyoming.asr import Transcribe, Transcript
 from wyoming.audio import AudioChunk, AudioStop
 from wyoming.event import Event
@@ -220,19 +222,9 @@ class WhisperEventHandler(AsyncEventHandler):
         return buf.getvalue()
 
     def _transcribe_sync(self, wav_data: bytes) -> str:
-        """POST audio to whisper.cpp and return transcript text (synchronous)."""
-        try:
-            with httpx.Client(timeout=self.config.whisper_timeout) as client:
-                response = client.post(
-                    self.config.whisper_url,
-                    files={"file": ("audio.wav", wav_data, "audio/wav")},
-                    data={"response_format": "json"},
-                )
-                response.raise_for_status()
-                return response.json().get("text", "").strip()
-        except Exception as exc:
-            log.error("Transcription failed: %s", exc)
-            return ""
+        """POST audio to whisper.cpp via the WhisperFacade and return transcript text."""
+        facade = WhisperFacade(url=self.config.whisper_url, timeout=self.config.whisper_timeout)
+        return facade.transcribe(wav_data)
 
     def _identify_speaker_sync(self, wav_data: bytes) -> dict:
         """POST audio to speaker-id server and return result (synchronous)."""

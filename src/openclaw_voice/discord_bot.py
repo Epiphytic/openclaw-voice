@@ -673,8 +673,10 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
                 )
 
                 # Check if log advanced while LLM was running (new speech arrived)
+                # BUT: don't discard if we already got an escalation or tool result —
+                # the work is valuable even if new speech arrived.
                 _, post_version = session.log.snapshot()
-                if post_version > pre_version:
+                if post_version > pre_version and not escalation and not response_text:
                     log.info(
                         "LLM response stale (log v%d → v%d), discarding",
                         pre_version,
@@ -683,6 +685,13 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
                     )
                     # STT worker already set pending_llm_trigger; loop back to wait
                     continue
+                if post_version > pre_version and (escalation or response_text):
+                    log.info(
+                        "Log advanced (v%d → v%d) but LLM produced useful output, keeping",
+                        pre_version,
+                        post_version,
+                        extra={"guild_id": guild_id},
+                    )
 
                 bot_name = pipeline.config.bot_name
                 agent_name = pipeline.config.main_agent_name
@@ -1060,15 +1069,20 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
         """
         channel_id = self._guild_text_channels.get(guild_id) or self._transcript_channel_id
         if not channel_id:
+            log.warning("No text channel for guild %s, skipping post", guild_id)
             return
 
         try:
             channel = self.get_channel(channel_id)
             if channel is None:
                 channel = await self.fetch_channel(channel_id)
+            # Truncate to Discord's 2000 char limit
+            if len(message) > 2000:
+                message = message[:1997] + "..."
             await channel.send(message)
+            log.debug("Posted to channel %s: %s", channel_id, message[:80])
         except Exception as exc:
-            log.warning("Failed to post to channel %s: %s", channel_id, exc)
+            log.warning("Failed to post to channel %s: %s", channel_id, exc, exc_info=True)
 
     def _rephrase_for_speech(self, pipeline: VoicePipeline, bel_response: str) -> str:
         """Use the LLM to rephrase the main agent's response for natural speech.

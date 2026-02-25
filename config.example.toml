@@ -33,6 +33,9 @@
 # ── Context window ───────────────────────────────────────────────────────────
 # max_history_turns = 20  # Max conversation turns to keep per channel
 
+# ── Word corrections ─────────────────────────────────────────────────────────
+# corrections_file = "/path/to/corrections.toml"  # Post-STT word replacement map
+
 # ── Bot identity & context ───────────────────────────────────────────────────
 # These values are injected into the system prompt. Customise to give your
 # voice bot a name, personality, and local context.

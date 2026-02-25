@@ -1,0 +1,47 @@
+# openclaw-voice configuration
+# Copy this file to your preferred location and pass it via:
+#   openclaw-voice discord-bot --config /path/to/config.toml
+#
+# All values shown are defaults. Uncomment and change as needed.
+# Environment variables (OPENCLAW_VOICE_*) override config file values.
+# CLI flags override both.
+
+[discord]
+# token = ""  # Or set OPENCLAW_VOICE_DISCORD_TOKEN env var
+# guild_id = 123456789  # Guild ID for slash command registration (omit for global)
+# transcript_channel_id = 123456789  # Channel for conversation transcripts (optional)
+
+# ── Service endpoints ────────────────────────────────────────────────────────
+# whisper_url = "http://localhost:8001/inference"  # whisper.cpp STT endpoint
+# kokoro_url = "http://localhost:8002/v1/audio/speech"  # Kokoro TTS endpoint
+# llm_url = "http://localhost:8000/v1/chat/completions"  # OpenAI-compatible LLM
+# speaker_id_url = "http://localhost:8003/identify"  # Speaker ID endpoint
+
+# ── LLM settings ─────────────────────────────────────────────────────────────
+# llm_model = "Qwen/Qwen3-8B"  # Model name for vLLM / OpenAI-compatible server
+
+# ── TTS settings ─────────────────────────────────────────────────────────────
+# tts_voice = "af_heart"  # Kokoro voice name
+
+# ── Speaker identification ───────────────────────────────────────────────────
+# enable_speaker_id = false
+
+# ── VAD (Voice Activity Detection) ───────────────────────────────────────────
+# vad_silence_ms = 1500  # Silence duration before flushing utterance
+# vad_min_speech_ms = 500  # Minimum speech duration to process
+
+# ── Context window ───────────────────────────────────────────────────────────
+# max_history_turns = 20  # Max conversation turns to keep per channel
+
+# ── Word corrections ─────────────────────────────────────────────────────────
+# corrections_file = "/path/to/corrections.toml"  # Post-STT word replacement map
+
+# ── Bot identity & context ───────────────────────────────────────────────────
+# These values are injected into the system prompt. Customise to give your
+# voice bot a name, personality, and local context.
+#
+# bot_name = "Assistant"  # The voice bot's name (e.g. "Chip", "Jarvis")
+# main_agent_name = "main agent"  # Name of the main AI agent for escalation
+# default_location = ""  # Default weather location (e.g. "Vancouver, BC, Canada")
+# default_timezone = "UTC"  # Default timezone (e.g. "America/Vancouver")
+# extra_context = ""  # Freeform context appended to system prompt

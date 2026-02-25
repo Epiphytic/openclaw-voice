@@ -51,8 +51,8 @@ from openclaw_voice.facades.resemblyzer import embed_utterance, get_encoder, pre
 log = logging.getLogger("openclaw_voice.speaker_id")
 
 # Minimum audio lengths
-MIN_IDENTIFY_SAMPLES = 1600   # ~0.1s at 16kHz
-MIN_ENROLL_SAMPLES = 8000     # ~0.5s at 16kHz
+MIN_IDENTIFY_SAMPLES = 1600  # ~0.1s at 16kHz
+MIN_ENROLL_SAMPLES = 8000  # ~0.5s at 16kHz
 TARGET_SAMPLE_RATE = 16000
 
 
@@ -119,10 +119,10 @@ def audio_to_array(content: bytes) -> np.ndarray:
             buf.seek(0)
             audio, sr = librosa.load(buf, sr=TARGET_SAMPLE_RATE, mono=True)
             return audio.astype(np.float32)
-        except ImportError:
+        except ImportError as exc:
             raise ValueError(
                 "Could not decode audio — install 'librosa' for broader format support"
-            )
+            ) from exc
 
     # Mono conversion
     if audio.ndim > 1:
@@ -134,11 +134,11 @@ def audio_to_array(content: bytes) -> np.ndarray:
             import librosa  # type: ignore[import]
 
             audio = librosa.resample(audio, orig_sr=sr, target_sr=TARGET_SAMPLE_RATE)
-        except ImportError:
+        except ImportError as exc:
             raise ValueError(
                 f"Audio sample rate is {sr} Hz but {TARGET_SAMPLE_RATE} Hz required — "
                 "install 'librosa' to enable automatic resampling"
-            )
+            ) from exc
 
     return audio.astype(np.float32)
 
@@ -175,7 +175,7 @@ def create_app(config: SpeakerIDConfig) -> FastAPI:
 
     @app.post("/identify")
     async def identify(
-        file: UploadFile = File(...),
+        file: UploadFile = File(...),  # noqa: B008
         threshold: float = Form(config.default_threshold),
     ) -> JSONResponse:
         """Identify the speaker in an audio file.
@@ -226,9 +226,7 @@ def create_app(config: SpeakerIDConfig) -> FastAPI:
         elapsed = round(time.time() - start, 3)
 
         if best_score >= threshold and best_name:
-            access_level = (
-                profiles[best_name].get("metadata", {}).get("access_level", "standard")
-            )
+            access_level = profiles[best_name].get("metadata", {}).get("access_level", "standard")
             return JSONResponse(
                 {
                     "speaker": best_name,
@@ -252,7 +250,7 @@ def create_app(config: SpeakerIDConfig) -> FastAPI:
     async def enroll(
         name: str = Form(...),
         access_level: str = Form("standard"),
-        file: UploadFile = File(...),
+        file: UploadFile = File(...),  # noqa: B008
     ) -> JSONResponse:
         """Enroll or update a speaker.
 
@@ -315,8 +313,7 @@ def create_app(config: SpeakerIDConfig) -> FastAPI:
                     "speaker": name,
                     "samples": 1,
                     "message": (
-                        f"Enrolled '{name}' with 1 sample. "
-                        "Add more samples for better accuracy."
+                        f"Enrolled '{name}' with 1 sample. Add more samples for better accuracy."
                     ),
                 }
             )

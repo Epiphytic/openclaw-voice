@@ -9,14 +9,13 @@ import pytest
 from openclaw_voice.vad import (
     FRAME_DURATION_MS,
     FRAME_SIZE,
-    SAMPLE_RATE,
     VoiceActivityDetector,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _silent_frame() -> bytes:
     """Return a 20ms frame of silence (all zeros)."""
@@ -39,11 +38,12 @@ def _make_frames(n: int, frame_fn) -> list[bytes]:
 # Initialisation
 # ---------------------------------------------------------------------------
 
+
 class TestVoiceActivityDetectorInit:
     def test_defaults(self):
         vad = VoiceActivityDetector()
         assert vad.aggressiveness == 3
-        assert vad.silence_threshold_ms == 800
+        assert vad.silence_threshold_ms == 1500
         assert not vad.is_speaking
 
     def test_custom_aggressiveness(self):
@@ -63,6 +63,7 @@ class TestVoiceActivityDetectorInit:
 # ---------------------------------------------------------------------------
 # Frame validation
 # ---------------------------------------------------------------------------
+
 
 class TestFrameValidation:
     def test_wrong_frame_size_raises(self):
@@ -86,6 +87,7 @@ class TestFrameValidation:
 # Silence detection
 # ---------------------------------------------------------------------------
 
+
 class TestSilenceDetection:
     def test_silence_does_not_trigger_utterance(self):
         vad = VoiceActivityDetector()
@@ -103,6 +105,7 @@ class TestSilenceDetection:
 # ---------------------------------------------------------------------------
 # Speech detection and utterance flushing
 # ---------------------------------------------------------------------------
+
 
 class TestSpeechDetection:
     def test_speech_sets_speaking_state(self):
@@ -167,6 +170,7 @@ class TestSpeechDetection:
 # Configurable silence threshold
 # ---------------------------------------------------------------------------
 
+
 class TestConfigurableSilenceThreshold:
     def test_short_threshold_flushes_faster(self):
         """A shorter silence threshold should flush sooner than a longer one."""
@@ -215,6 +219,7 @@ class TestConfigurableSilenceThreshold:
 # ---------------------------------------------------------------------------
 # Reset
 # ---------------------------------------------------------------------------
+
 
 class TestReset:
     def test_reset_clears_state(self):

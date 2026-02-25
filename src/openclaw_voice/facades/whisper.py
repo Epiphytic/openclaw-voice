@@ -42,6 +42,7 @@ class WhisperFacade:
         *,
         language: str | None = None,
         response_format: str = "json",
+        initial_prompt: str | None = None,
     ) -> str:
         """POST WAV audio to whisper.cpp and return the transcript text.
 
@@ -56,6 +57,8 @@ class WhisperFacade:
         form_data: dict[str, str] = {"response_format": response_format}
         if language:
             form_data["language"] = language
+        if initial_prompt:
+            form_data["initial_prompt"] = initial_prompt
 
         try:
             with httpx.Client(timeout=self._timeout) as client:

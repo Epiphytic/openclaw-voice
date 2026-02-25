@@ -1,0 +1,16 @@
+# Word/phrase corrections applied after Whisper transcription.
+# Format: "wrong" = "right" (case-insensitive matching, word-boundary aware)
+#
+# Copy this file to corrections.toml (or wherever corrections_file points)
+# and customise for your environment.
+
+[corrections]
+"Bell" = "Bel"
+"Bill" = "Bel"
+"Bale" = "Bel"
+"Belle" = "Bel"
+"GERT" = "GIRT"
+"Gert" = "GIRT"
+"ships" = "Chip's"
+"Cassady" = "Cassidy"
+"Ladysmith" = "Ladysmith"

@@ -24,10 +24,10 @@
 | `run_stt_bridge()` | `src/openclaw_voice/stt_bridge.py` | Runs the Wyoming STT bridge (whisper.cpp backend). | `wyoming`, `httpx` | N (Long-running) |
 | `run_tts_bridge()` | `src/openclaw_voice/tts_bridge.py` | Runs the Wyoming TTS bridge (Kokoro backend). | `wyoming`, `httpx` | N (Long-running) |
 | `run_speaker_id()` | `src/openclaw_voice/speaker_id.py` | Runs the Speaker ID HTTP server (Resemblyzer backend). | `fastapi`, `uvicorn` | N (Long-running) |
-| `VoiceActivityDetector` | `src/openclaw_voice/vad.py` | VAD class: segments 16kHz int16 mono PCM audio into utterances using webrtcvad. Configurable aggressiveness and silence threshold. | `webrtcvad` | Y |
-| `VoicePipeline` | `src/openclaw_voice/voice_pipeline.py` | Orchestrates STT → LLM → TTS pipeline for Discord voice. Maintains per-channel conversation history. | `httpx`, `WhisperFacade`, `KokoroFacade` | N (stateful) |
-| `VoiceBot` | `src/openclaw_voice/discord_bot.py` | Discord voice channel bot (py-cord). Slash commands: /join, /leave, /voice. Per-user VAD + VoicePipeline per guild. | `py-cord[voice]`, `PyNaCl`, `VoicePipeline`, `VoiceActivityDetector` | N (Long-running) |
-| `create_bot()` | `src/openclaw_voice/discord_bot.py` | Factory function for VoiceBot with sane intents defaults. | `py-cord` | Y |
+| `VoiceActivityDetector` | `src/openclaw_voice/vad.py` | VAD class: segments 16kHz int16 mono PCM audio into utterances using webrtcvad. Configurable aggressiveness, silence threshold (default 1500ms), and min speech duration (default 500ms). | `webrtcvad` | Y |
+| `VoicePipeline` | `src/openclaw_voice/voice_pipeline.py` | Orchestrates STT → LLM → TTS pipeline for Discord voice. Maintains per-channel conversation history. Returns (transcript, response_text, response_audio). Logs per-stage timing (stt_ms, llm_ms, tts_ms, total_ms). | `httpx`, `WhisperFacade`, `KokoroFacade` | N (stateful) |
+| `VoiceBot` | `src/openclaw_voice/discord_bot.py` | Discord voice channel bot (py-cord). Slash commands: /join, /leave, /voice. Per-user VAD + VoicePipeline per guild. Per-user Task dispatch with cancellation (new utterance cancels in-flight response). Max response age guard (5s). Transcript posting to a configurable Discord channel. | `py-cord[voice]`, `PyNaCl`, `VoicePipeline`, `VoiceActivityDetector` | N (Long-running) |
+| `create_bot()` | `src/openclaw_voice/discord_bot.py` | Factory function for VoiceBot with sane intents defaults. Accepts transcript_channel_id, vad_silence_ms, vad_min_speech_ms. | `py-cord` | Y |
 
 ---
 

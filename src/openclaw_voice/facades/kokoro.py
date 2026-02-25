@@ -94,9 +94,7 @@ class KokoroFacade:
             httpx.HTTPStatusError: On non-2xx HTTP response.
             httpx.RequestError:    On connection failure.
         """
-        payload = self.build_payload(
-            text, voice, response_format=response_format, speed=speed
-        )
+        payload = self.build_payload(text, voice, response_format=response_format, speed=speed)
 
         log.debug(
             "Starting Kokoro synthesis stream",
@@ -109,8 +107,10 @@ class KokoroFacade:
             },
         )
 
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            async with client.stream("POST", self._url, json=payload) as resp:
-                resp.raise_for_status()
-                async for chunk in resp.aiter_bytes(chunk_size=chunk_size):
-                    yield chunk
+        async with (
+            httpx.AsyncClient(timeout=self._timeout) as client,
+            client.stream("POST", self._url, json=payload) as resp,
+        ):
+            resp.raise_for_status()
+            async for chunk in resp.aiter_bytes(chunk_size=chunk_size):
+                yield chunk

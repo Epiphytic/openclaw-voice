@@ -2,7 +2,7 @@
 
 **Status:** Accepted  
 **Date:** 2026-02-24  
-**Author:** Liam (Belthanior)
+**Author:** Belthanior
 
 ---
 

@@ -40,14 +40,13 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-
-from openclaw_voice.facades.whisper import WhisperFacade
-
 from wyoming.asr import Transcribe, Transcript
 from wyoming.audio import AudioChunk, AudioStop
 from wyoming.event import Event
 from wyoming.info import AsrModel, AsrProgram, Attribution, Describe, Info
 from wyoming.server import AsyncEventHandler, AsyncServer
+
+from openclaw_voice.facades.whisper import WhisperFacade
 
 log = logging.getLogger("openclaw_voice.stt")
 
@@ -161,13 +160,9 @@ class WhisperEventHandler(AsyncEventHandler):
 
         # Run transcription and (optional) speaker ID in parallel
         loop = asyncio.get_event_loop()
-        tasks: list[asyncio.Task] = [
-            loop.run_in_executor(None, self._transcribe_sync, wav_data)
-        ]
+        tasks: list[asyncio.Task] = [loop.run_in_executor(None, self._transcribe_sync, wav_data)]
         if self.config.enable_speaker_id:
-            tasks.append(
-                loop.run_in_executor(None, self._identify_speaker_sync, wav_data)
-            )
+            tasks.append(loop.run_in_executor(None, self._identify_speaker_sync, wav_data))
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
 

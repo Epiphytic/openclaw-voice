@@ -59,6 +59,31 @@ def _load_toml_config(path: Path) -> dict:
         return {}
 
 
+def _load_openclaw_config() -> dict:
+    """Load voice config from the main OpenClaw config (~/.openclaw/openclaw.json).
+
+    Looks for a ``voice`` key in the top-level config.  Returns the dict
+    or empty dict if not found.
+    """
+    import json as _json
+
+    candidates = [
+        Path.home() / ".openclaw" / "openclaw.json",
+        Path(os.environ.get("OPENCLAW_HOME", "")) / "openclaw.json",
+    ]
+    for p in candidates:
+        if p.is_file():
+            try:
+                data = _json.loads(p.read_text())
+                voice_cfg = data.get("voice", {})
+                if voice_cfg:
+                    log.debug("Loaded voice config from %s", p)
+                    return voice_cfg
+            except Exception as exc:
+                log.debug("Could not read voice config from %s: %s", p, exc)
+    return {}
+
+
 def _env(key: str, default: str | None = None) -> str | None:
     """Read an environment variable with the OPENCLAW_VOICE_ prefix."""
     return os.environ.get(f"OPENCLAW_VOICE_{key.upper()}", default)
@@ -174,11 +199,10 @@ def stt_cmd(
         speaker_id_url=speaker_id_url
         or cfg_file.get("speaker_id_url", "http://localhost:8003/identify"),
         enable_speaker_id=speaker_id or cfg_file.get("enable_speaker_id", False),
-        speaker_id_threshold=speaker_id_threshold
-        or cfg_file.get("speaker_id_threshold", 0.75),
-        transcript_log=Path(transcript_log) if transcript_log else (
-            Path(cfg_file["transcript_log"]) if "transcript_log" in cfg_file else None
-        ),
+        speaker_id_threshold=speaker_id_threshold or cfg_file.get("speaker_id_threshold", 0.75),
+        transcript_log=Path(transcript_log)
+        if transcript_log
+        else (Path(cfg_file["transcript_log"]) if "transcript_log" in cfg_file else None),
         model_name=model_name or cfg_file.get("model_name", "large-v3-turbo"),
         whisper_timeout=whisper_timeout or cfg_file.get("whisper_timeout", 30.0),
     )
@@ -247,9 +271,7 @@ def tts_cmd(
 @_config_option
 @_log_level_option
 @click.option("--host", default=lambda: _env("SPEAKER_ID_HOST", "0.0.0.0"), help="Bind host")
-@click.option(
-    "--port", default=lambda: _env("SPEAKER_ID_PORT", "8003"), type=int, help="Bind port"
-)
+@click.option("--port", default=lambda: _env("SPEAKER_ID_PORT", "8003"), type=int, help="Bind port")
 @click.option(
     "--profiles-dir",
     default=lambda: _env("PROFILES_DIR", "./speaker-profiles"),
@@ -340,14 +362,14 @@ def all_cmd(
     """Start STT bridge, TTS bridge, and Speaker ID server concurrently."""
     _setup_logging(log_level)
 
-    cfg_file: dict = {}
     if config:
-        cfg_file = _load_toml_config(Path(config))
+        _load_toml_config(Path(config))
 
+    import threading
+
+    from openclaw_voice.speaker_id import SpeakerIDConfig, run_speaker_id
     from openclaw_voice.stt_bridge import STTConfig, run_stt_bridge
     from openclaw_voice.tts_bridge import TTSConfig, run_tts_bridge
-    from openclaw_voice.speaker_id import SpeakerIDConfig, run_speaker_id
-    import threading
 
     stt_cfg = STTConfig(
         port=stt_port,
@@ -447,6 +469,24 @@ def all_cmd(
     type=int,
     help="Max conversation turns to keep per channel",
 )
+@click.option(
+    "--vad-silence-ms",
+    default=lambda: int(_env("VAD_SILENCE_MS", "1500")),
+    type=int,
+    help="VAD silence threshold in ms before flushing an utterance (default 1500)",
+)
+@click.option(
+    "--vad-min-speech-ms",
+    default=lambda: int(_env("VAD_MIN_SPEECH_MS", "500")),
+    type=int,
+    help="VAD minimum speech duration in ms to emit an utterance (default 500)",
+)
+@click.option(
+    "--transcript-channel-id",
+    default=lambda: _env("TRANSCRIPT_CHANNEL_ID"),
+    type=str,
+    help="Discord channel ID for posting conversation transcripts (optional)",
+)
 def discord_bot_cmd(
     config: str | None,
     log_level: str,
@@ -460,6 +500,9 @@ def discord_bot_cmd(
     speaker_id: bool,
     speaker_id_url: str,
     max_history: int,
+    vad_silence_ms: int,
+    vad_min_speech_ms: int,
+    transcript_channel_id: str | None,
 ) -> None:
     """Start the Discord voice channel bot."""
     _setup_logging(log_level)
@@ -468,13 +511,19 @@ def discord_bot_cmd(
     if config:
         cfg_file = _load_toml_config(Path(config)).get("discord", {})
 
+    # Also check OpenClaw config for a [voice] section as fallback
+    if not cfg_file:
+        openclaw_cfg = _load_openclaw_config()
+        if openclaw_cfg:
+            cfg_file = openclaw_cfg
+
     # Resolve token (CLI > env > config file)
     resolved_token = token or cfg_file.get("token")
     if not resolved_token:
         import click as _click
+
         raise _click.ClickException(
-            "Discord bot token is required. "
-            "Pass --token or set OPENCLAW_VOICE_DISCORD_TOKEN."
+            "Discord bot token is required. Pass --token or set OPENCLAW_VOICE_DISCORD_TOKEN."
         )
 
     # Resolve guild IDs
@@ -485,24 +534,58 @@ def discord_bot_cmd(
         raw = cfg_file["guild_id"]
         resolved_guild_ids = [int(raw)] if isinstance(raw, (str, int)) else [int(g) for g in raw]
 
-    from openclaw_voice.discord_bot import PipelineConfig, create_bot
+    from openclaw_voice.discord_bot import (
+        DEFAULT_VAD_MIN_SPEECH_MS,
+        DEFAULT_VAD_SILENCE_MS,
+        PipelineConfig,
+        create_bot,
+    )
+
+    # Config file values override CLI defaults (CLI explicit flags still win
+    # via env vars, but when --config is given, its values take precedence
+    # over hardcoded click defaults).
+    def _resolve(cli_val, key: str, fallback=None):
+        """Config file wins over CLI default; explicit CLI/env wins over config."""
+        cfg_val = cfg_file.get(key)
+        if cfg_val is not None:
+            return cfg_val
+        return cli_val if cli_val is not None else fallback
 
     pipeline_config = PipelineConfig(
-        whisper_url=whisper_url or cfg_file.get("whisper_url", "http://localhost:8001/inference"),
-        kokoro_url=kokoro_url or cfg_file.get("kokoro_url", "http://localhost:8002/v1/audio/speech"),
-        llm_url=llm_url or cfg_file.get("llm_url", "http://localhost:8000/v1/chat/completions"),
-        llm_model=llm_model or cfg_file.get("llm_model", "Qwen/Qwen2.5-32B-Instruct"),
-        tts_voice=tts_voice or cfg_file.get("tts_voice", "af_heart"),
-        enable_speaker_id=speaker_id or cfg_file.get("enable_speaker_id", False),
-        speaker_id_url=speaker_id_url or cfg_file.get(
-            "speaker_id_url", "http://localhost:8003/identify"
-        ),
-        max_history_turns=max_history or cfg_file.get("max_history_turns", 20),
+        whisper_url=_resolve(whisper_url, "whisper_url", "http://localhost:8001/inference"),
+        kokoro_url=_resolve(kokoro_url, "kokoro_url", "http://localhost:8002/v1/audio/speech"),
+        llm_url=_resolve(llm_url, "llm_url", "http://localhost:8000/v1/chat/completions"),
+        llm_model=_resolve(llm_model, "llm_model", "Qwen/Qwen2.5-32B-Instruct"),
+        tts_voice=_resolve(tts_voice, "tts_voice", "af_heart"),
+        enable_speaker_id=_resolve(speaker_id, "enable_speaker_id", False),
+        speaker_id_url=_resolve(speaker_id_url, "speaker_id_url", "http://localhost:8003/identify"),
+        max_history_turns=_resolve(max_history, "max_history_turns", 20),
+        # Identity & context from config file (not hardcoded)
+        bot_name=cfg_file.get("bot_name", "Assistant"),
+        main_agent_name=cfg_file.get("main_agent_name", "main agent"),
+        default_location=cfg_file.get("default_location", ""),
+        default_timezone=cfg_file.get("default_timezone", "UTC"),
+        extra_context=cfg_file.get("extra_context", ""),
+        whisper_prompt=cfg_file.get("whisper_prompt", ""),
+        corrections_file=cfg_file.get("corrections_file", ""),
     )
+
+    # Resolve VAD and transcript settings (CLI > env > config file > defaults)
+    resolved_vad_silence_ms: int = vad_silence_ms or int(
+        cfg_file.get("vad_silence_ms", DEFAULT_VAD_SILENCE_MS)
+    )
+    resolved_vad_min_speech_ms: int = vad_min_speech_ms or int(
+        cfg_file.get("vad_min_speech_ms", DEFAULT_VAD_MIN_SPEECH_MS)
+    )
+    raw_channel_id = transcript_channel_id or cfg_file.get("transcript_channel_id")
+    resolved_transcript_channel_id: int | None = int(raw_channel_id) if raw_channel_id else None
 
     bot = create_bot(
         pipeline_config=pipeline_config,
         guild_ids=resolved_guild_ids if resolved_guild_ids else None,
+        transcript_channel_id=resolved_transcript_channel_id,
+        vad_silence_ms=resolved_vad_silence_ms,
+        vad_min_speech_ms=resolved_vad_min_speech_ms,
     )
 
     log.info(
@@ -511,6 +594,9 @@ def discord_bot_cmd(
             "guild_ids": resolved_guild_ids,
             "llm_model": pipeline_config.llm_model,
             "tts_voice": pipeline_config.tts_voice,
+            "vad_silence_ms": resolved_vad_silence_ms,
+            "vad_min_speech_ms": resolved_vad_min_speech_ms,
+            "transcript_channel_id": resolved_transcript_channel_id,
         },
     )
 

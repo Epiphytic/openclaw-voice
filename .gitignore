@@ -50,3 +50,4 @@ logs/
 *.pt
 *.gguf
 chip.pid
+plugin/node_modules/

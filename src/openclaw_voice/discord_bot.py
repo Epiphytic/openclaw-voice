@@ -439,9 +439,18 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
         if message.author.id == self.user.id:
             return
 
+        # Skip messages from the main agent bot (belthanior) — escalation
+        # responses already come through the TTS pipeline directly.
+        # The channel posts are just text records for non-voice participants.
+        if message.author.bot:
+            author_lower = (message.author.display_name or message.author.name or "").lower()
+            main_name = self._pipeline_config.main_agent_name.lower()
+            if author_lower in (main_name, "belthanior", "bel"):
+                log.debug("on_message: skipping main agent bot message from %s", author_lower)
+                return
+
         # Skip messages from users currently in the voice channel — they can hear themselves
-        session = self._sessions.get(guild_id)
-        if session and not message.author.bot:
+        if not message.author.bot:
             vc = message.guild.voice_client if message.guild else None
             if vc and vc.channel:
                 voice_member_ids = {m.id for m in vc.channel.members}
@@ -450,16 +459,6 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
 
         content = message.content.strip()
         if not content:
-            return
-
-        # Skip messages whose core text was already spoken via TTS (e.g. escalation
-        # results posted by Bel that Chip already played as audio)
-        recently_spoken = getattr(session, "_recently_spoken", set())
-        # Strip emoji prefixes and bold formatting for comparison
-        import re as _re
-        plain = _re.sub(r'^[^\w]*\*\*\w+\*\*:\s*', '', content).strip()
-        if plain and plain in recently_spoken:
-            log.debug("on_message: skipping already-spoken text (%.60s)", plain)
             return
 
         pipeline = self._pipelines.get(guild_id)
@@ -498,22 +497,8 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
                 log.warning("Failed to summarize channel message: %s", exc)
                 content = " ".join(content.split()[:250]) + "…"
 
-        # Identify other speakers, but not ourselves (Chip = belthanior to the user)
-        # The OpenClaw bot (belthanior) posts Bel's responses — same entity from
-        # the user's perspective, so no attribution needed.
-        main_agent_name = self._pipeline_config.main_agent_name.lower()
-        author_name_lower = display_name.lower()
-        is_self = (
-            author_name_lower == main_agent_name
-            or author_name_lower == self._pipeline_config.bot_name.lower()
-            or author_name_lower in ("belthanior", "bel")
-        )
-        if is_self:
-            # Strip any emoji/bold prefix like "🜂 **Bel**: " from the content
-            import re as _re
-            tts_text = _re.sub(r'^[^\w]*\*\*\w+\*\*:\s*', '', content).strip() or content
-        else:
-            tts_text = f"{display_name} says: {content}"
+        # Attribute the speaker (main agent bot is already filtered above)
+        tts_text = f"{display_name} says: {content}"
 
         log.info(
             "Text-to-voice bridge: reading channel message",
@@ -1132,14 +1117,6 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
             await self._post_to_channel(
                 guild_id, f"🜂 **{agent_name}**: {bel_response}"
             )
-
-            # Track this text so on_message bridge won't re-read it
-            if not hasattr(session, "_recently_spoken"):
-                session._recently_spoken = set()
-            session._recently_spoken.add(bel_response)
-            # Cap the set size
-            if len(session._recently_spoken) > 20:
-                session._recently_spoken = set(list(session._recently_spoken)[-10:])
 
             # TTS render directly — no rephrase
             audio = await loop.run_in_executor(

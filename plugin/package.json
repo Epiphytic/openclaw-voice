@@ -1,13 +1,31 @@
 {
   "name": "@epiphytic/openclaw-discord-voice",
   "version": "0.1.0",
-  "description": "OpenClaw plugin for Discord voice bot (Chip)",
+  "description": "OpenClaw plugin for real-time Discord voice assistant with local LLM, STT, and TTS",
   "type": "module",
-  "dependencies": {
-    "@sinclair/typebox": "0.34.48"
+  "main": "index.ts",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Epiphytic/openclaw-voice.git",
+    "directory": "plugin"
   },
-  "devDependencies": {
-    "openclaw": "workspace:*"
+  "keywords": [
+    "openclaw",
+    "openclaw-plugin",
+    "discord",
+    "voice",
+    "tts",
+    "stt",
+    "llm"
+  ],
+  "files": [
+    "index.ts",
+    "openclaw.plugin.json",
+    "README.md"
+  ],
+  "dependencies": {
+    "@sinclair/typebox": "^0.34.0"
   },
   "openclaw": {
     "extensions": [

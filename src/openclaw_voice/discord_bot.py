@@ -452,6 +452,16 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
         if not content:
             return
 
+        # Skip messages whose core text was already spoken via TTS (e.g. escalation
+        # results posted by Bel that Chip already played as audio)
+        recently_spoken = getattr(session, "_recently_spoken", set())
+        # Strip emoji prefixes and bold formatting for comparison
+        import re as _re
+        plain = _re.sub(r'^[^\w]*\*\*\w+\*\*:\s*', '', content).strip()
+        if plain and plain in recently_spoken:
+            log.debug("on_message: skipping already-spoken text (%.60s)", plain)
+            return
+
         pipeline = self._pipelines.get(guild_id)
         if pipeline is None:
             return
@@ -488,7 +498,7 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
                 log.warning("Failed to summarize channel message: %s", exc)
                 content = " ".join(content.split()[:250]) + "…"
 
-        tts_text = f"{display_name} says: {content}"
+        tts_text = content
 
         log.info(
             "Text-to-voice bridge: reading channel message",
@@ -1107,6 +1117,14 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
             await self._post_to_channel(
                 guild_id, f"🜂 **{agent_name}**: {bel_response}"
             )
+
+            # Track this text so on_message bridge won't re-read it
+            if not hasattr(session, "_recently_spoken"):
+                session._recently_spoken = set()
+            session._recently_spoken.add(bel_response)
+            # Cap the set size
+            if len(session._recently_spoken) > 20:
+                session._recently_spoken = set(list(session._recently_spoken)[-10:])
 
             # TTS render directly — no rephrase
             audio = await loop.run_in_executor(

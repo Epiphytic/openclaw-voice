@@ -1,10 +1,12 @@
 """
-Discord Voice Channel Bot — openclaw-voice.
+Discord Voice Channel Bot — openclaw-voice (v2 worker architecture).
 
 Joins Discord voice channels and provides interactive voice conversation:
   - Listens to users via per-user audio streams (pycord voice receive)
   - VAD segments speech into utterances
-  - Runs each utterance through VoicePipeline (STT → LLM → TTS)
+  - Four independent async worker loops per guild: STT → LLM → TTS + Escalation
+  - ConversationLog is the single source of truth for conversation state
+  - New speech cancels TTS only; LLM and escalation work survives interrupts
   - Plays back TTS audio in the voice channel
 
 Slash commands:
@@ -31,8 +33,10 @@ import tempfile
 import time
 from pathlib import Path
 
+from openclaw_voice.conversation_log import ConversationLog, LogEntry
 from openclaw_voice.vad import FRAME_SIZE, SAMPLE_RATE, SAMPLE_WIDTH, VoiceActivityDetector
 from openclaw_voice.voice_pipeline import PipelineConfig, VoicePipeline
+from openclaw_voice.voice_session import VoiceSession
 
 log = logging.getLogger("openclaw_voice.discord_bot")
 
@@ -58,13 +62,13 @@ DISCORD_SAMPLE_WIDTH = 2  # int16
 # Max size of the response playback queue
 PLAYBACK_QUEUE_MAXSIZE = 10
 
-# If a pipeline response is older than this (seconds since utterance was enqueued)
-# by the time it would play, discard it — the user has moved on.
-MAX_RESPONSE_AGE_S: float = 120.0
-
 # Default VAD settings — tuned for natural speech with brief pauses
 DEFAULT_VAD_SILENCE_MS = 1500
 DEFAULT_VAD_MIN_SPEECH_MS = 500
+
+# Escalation worker timing
+ESCALATION_KEEPALIVE_S = 20
+ESCALATION_MAX_WAIT_S = 120
 
 
 # ---------------------------------------------------------------------------
@@ -75,20 +79,25 @@ DEFAULT_VAD_MIN_SPEECH_MS = 500
 class VoiceSink(Sink):  # type: ignore[misc]
     """Custom pycord Sink that feeds per-user audio through VAD.
 
-    When a complete utterance is detected for a user, it is placed on
-    the shared ``utterance_queue`` for async processing.
+    When a complete utterance is detected for a user (via debounce timer), it
+    is placed on the session's ``stt_queue`` for async processing by the STT worker.
+
+    New speech immediately signals ``tts_cancel`` so in-flight TTS is interrupted.
 
     Args:
-        utterance_queue: asyncio.Queue for (user_id, pcm_bytes, enqueued_at, seq) tuples.
+        stt_queue:       asyncio.Queue for (user_id, pcm_bytes, enqueued_at, seq) tuples.
         loop:            The running asyncio event loop.
+        tts_cancel:      asyncio.Event to set when new speech arrives (cancels TTS).
         vad_silence_ms:  Silence threshold in ms before flushing an utterance.
         vad_min_speech_ms: Minimum speech ms to be considered a real utterance.
+        bot_user_id:     Bot's own user ID (audio from self is ignored).
     """
 
     def __init__(
         self,
-        utterance_queue: asyncio.Queue,  # type: ignore[type-arg]
+        stt_queue: asyncio.Queue,  # type: ignore[type-arg]
         loop: asyncio.AbstractEventLoop,
+        tts_cancel: asyncio.Event | None = None,
         vad_silence_ms: int = DEFAULT_VAD_SILENCE_MS,
         vad_min_speech_ms: int = DEFAULT_VAD_MIN_SPEECH_MS,
         bot_user_id: int = 0,
@@ -96,8 +105,9 @@ class VoiceSink(Sink):  # type: ignore[misc]
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
-        self._utterance_queue = utterance_queue
+        self._stt_queue = stt_queue
         self._loop = loop
+        self._tts_cancel = tts_cancel
         self._vad_silence_ms = vad_silence_ms
         self._vad_min_speech_ms = vad_min_speech_ms
         self._bot_user_id = bot_user_id
@@ -121,14 +131,16 @@ class VoiceSink(Sink):  # type: ignore[misc]
         timer. When no packets arrive for ``_flush_delay_s`` (250ms), the
         timer fires and emits the accumulated audio as an utterance.
 
-        If new speech arrives while a previous utterance is being processed,
-        the dispatcher in VoiceBot handles cancellation and concatenation.
+        Signals tts_cancel immediately on new speech so the TTS worker is
+        interrupted as soon as the user starts talking.
         """
         # Ignore our own audio (bot hearing itself through Discord)
         if user == self._bot_user_id:
             return
 
-
+        # Signal new speech → cancel any in-flight TTS immediately (thread-safe)
+        if self._tts_cancel is not None:
+            self._loop.call_soon_threadsafe(self._tts_cancel.set)
 
         # Accumulate raw data in resample buffer
         buf = self._buffers.get(user, b"") + data
@@ -188,7 +200,7 @@ class VoiceSink(Sink):  # type: ignore[misc]
             "Debounce flush",
             extra={"user_id": user, "duration_ms": duration_ms, "bytes": len(audio), "seq": seq},
         )
-        self._utterance_queue.put_nowait(
+        self._stt_queue.put_nowait(
             (user, bytes(audio), time.monotonic(), seq),
         )
 
@@ -233,6 +245,14 @@ class VoiceSink(Sink):  # type: ignore[misc]
 class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[misc]
     """Discord bot that listens in voice channels and responds via TTS.
 
+    v2 architecture uses four independent async worker loops per guild:
+      - STT worker: transcribes audio, appends user_speech to ConversationLog
+      - LLM worker: waits for trigger, calls LLM, appends assistant entry
+      - TTS worker: synthesises speech, queues audio for playback
+      - Escalation worker: handles gateway calls (spawned as needed)
+
+    ConversationLog is the single source of truth. New speech cancels TTS only.
+
     Args:
         pipeline_config:      VoicePipeline configuration.
         guild_ids:            List of guild IDs to register slash commands for.
@@ -271,12 +291,14 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
         # Per-guild voice pipelines (one per active voice channel)
         self._pipelines: dict[int, VoicePipeline] = {}
 
-        # Per-guild utterance queues and sink references
-        self._utterance_queues: dict[int, asyncio.Queue] = {}  # type: ignore[type-arg]
-        self._processing_tasks: dict[int, asyncio.Task] = {}  # type: ignore[type-arg]
-        self._playback_queues: dict[int, asyncio.Queue] = {}  # type: ignore[type-arg]
+        # Per-guild voice sessions (own all worker tasks + conversation log)
+        self._sessions: dict[int, VoiceSession] = {}
+
+        # Per-guild sink refs for mute detection
+        self._sinks: dict[int, VoiceSink] = {}
+
+        # Per-guild playback tasks (separate from session workers — plays audio queue)
         self._playback_tasks: dict[int, asyncio.Task] = {}  # type: ignore[type-arg]
-        self._sinks: dict[int, VoiceSink] = {}  # per-guild sink refs for mute detection
 
         self._register_commands()
 
@@ -312,11 +334,14 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
                         "Mute detected — flushing utterance",
                         extra={"user_id": user_id, "bytes": len(utterance)},
                     )
-                    q = self._utterance_queues.get(guild_id)
-                    if q is not None:
+                    session = self._sessions.get(guild_id)
+                    if session is not None:
                         uid_int = int(user_id)
                         sink._user_seqs[uid_int] = sink._user_seqs.get(uid_int, 0) + 1
-                        await q.put((user_id, utterance, time.monotonic(), sink._user_seqs[uid_int]))
+                        session.tts_cancel.set()
+                        await session.stt_queue.put(
+                            (uid_int, utterance, time.monotonic(), sink._user_seqs[uid_int])
+                        )
 
     # ------------------------------------------------------------------
     # Slash commands
@@ -454,27 +479,31 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
             channel_id=str(guild_id),
         )
 
-        # Inject channel context into the system prompt
+        # Build system prompt with channel context injected
+        system_prompt = pipeline.build_system_prompt()
         context_addition = f"\n\nYou are in the '{channel_name}' voice channel on the '{guild_name}' Discord server."
         if channel_memory:
-            # Take last ~500 chars of channel memory for context
             summary = channel_memory[-1500:] if len(channel_memory) > 1500 else channel_memory
             context_addition += f"\n\nRecent channel context:\n{summary}"
-        pipeline._system_prompt += context_addition
+        system_prompt += context_addition
 
         self._pipelines[guild_id] = pipeline
 
-        # Create queues
-        utterance_q: asyncio.Queue = asyncio.Queue()  # type: ignore[type-arg]
-        playback_q: asyncio.Queue = asyncio.Queue(maxsize=PLAYBACK_QUEUE_MAXSIZE)  # type: ignore[type-arg]
-        self._utterance_queues[guild_id] = utterance_q
-        self._playback_queues[guild_id] = playback_q
+        # Create VoiceSession (holds log, worker tasks, playback queue, events)
+        session = VoiceSession(system_prompt=system_prompt, guild_id=guild_id)
 
-        # Start the voice sink with configurable VAD parameters
+        # Attach queue and event not yet in VoiceSession dataclass
+        session.stt_queue: asyncio.Queue = asyncio.Queue()  # type: ignore[attr-defined]
+        session.pending_tts: asyncio.Event = asyncio.Event()  # type: ignore[attr-defined]
+
+        self._sessions[guild_id] = session
+
+        # Start the voice sink — feeds audio into session.stt_queue
         loop = asyncio.get_event_loop()
         sink = VoiceSink(
-            utterance_q,
-            loop,
+            stt_queue=session.stt_queue,
+            loop=loop,
+            tts_cancel=session.tts_cancel,
             vad_silence_ms=self._vad_silence_ms,
             vad_min_speech_ms=self._vad_min_speech_ms,
             bot_user_id=self.user.id,
@@ -482,28 +511,44 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
         self._sinks[guild_id] = sink
         vc.start_recording(sink, self._on_recording_finished, guild_id)
 
-        # Start processing and playback tasks
-        self._processing_tasks[guild_id] = asyncio.create_task(
-            self._process_utterances(guild_id, vc)
+        # Start the three persistent workers (STT, LLM, TTS)
+        session.stt_task = asyncio.create_task(
+            self._stt_worker(guild_id, session),
+            name=f"stt-{guild_id}",
         )
-        self._playback_tasks[guild_id] = asyncio.create_task(self._playback_worker(guild_id, vc))
+        session.llm_task = asyncio.create_task(
+            self._llm_worker(guild_id, session),
+            name=f"llm-{guild_id}",
+        )
+        session.tts_task = asyncio.create_task(
+            self._tts_worker(guild_id, session),
+            name=f"tts-{guild_id}",
+        )
 
-        log.info("Started listening in guild %s", guild_id)
+        # Playback worker (plays audio from session.playback_queue into voice channel)
+        self._playback_tasks[guild_id] = asyncio.create_task(
+            self._playback_worker(guild_id, session, vc),
+            name=f"playback-{guild_id}",
+        )
+
+        log.info("Started listening in guild %s (v2 workers)", guild_id)
 
     async def _stop_listening(self, guild_id: int) -> None:
         """Stop recording and clean up resources for a guild."""
-        # Cancel processing task
-        for tasks in (self._processing_tasks, self._playback_tasks):
-            task = tasks.pop(guild_id, None)
-            if task and not task.done():
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
+        # Stop all session workers (STT, LLM, TTS, escalation)
+        session = self._sessions.pop(guild_id, None)
+        if session is not None:
+            await session.stop_workers()
 
-        # Clean up pipelines and queues
+        # Cancel playback task (not managed by VoiceSession)
+        playback_task = self._playback_tasks.pop(guild_id, None)
+        if playback_task and not playback_task.done():
+            playback_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await playback_task
+
+        # Clean up remaining per-guild state
         self._pipelines.pop(guild_id, None)
-        self._utterance_queues.pop(guild_id, None)
-        self._playback_queues.pop(guild_id, None)
         self._sinks.pop(guild_id, None)
 
         log.info("Stopped listening in guild %s", guild_id)
@@ -513,276 +558,350 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
         sink.cleanup()
         log.debug("Recording finished for guild %s", guild_id)
 
-    async def _process_utterances(
-        self,
-        guild_id: int,
-        vc: discord.VoiceClient,
-    ) -> None:
-        """Dispatch per-user pipeline tasks from the utterance queue.
+    # ------------------------------------------------------------------
+    # Worker loops (v2)
+    # ------------------------------------------------------------------
 
-        Each user gets their own asyncio Task so that a new utterance from
-        the same user immediately cancels any in-flight response — preventing
-        stale responses from piling up when speech is fragmented.
+    async def _stt_worker(self, guild_id: int, session: VoiceSession) -> None:
+        """STT worker: pull audio from stt_queue, transcribe, append to log.
 
-        Utterance tuples from VoiceSink: ``(user_id, pcm_bytes, enqueued_at, seq)``
+        Never cancelled by new speech. Runs until /leave.
         """
-        if guild_id not in self._utterance_queues:
-            log.error("Utterance queue missing for guild %s", guild_id)
+        pipeline = self._pipelines.get(guild_id)
+        if pipeline is None:
+            log.error("STT worker started but no pipeline for guild %s", guild_id)
             return
 
-        log.debug("Utterance dispatcher started for guild %s", guild_id)
-        utterance_q = self._utterance_queues[guild_id]
-
-        # Per-user in-flight pipeline tasks and accumulated audio
-        user_tasks: dict[int, asyncio.Task] = {}  # type: ignore[type-arg]
-        user_audio: dict[int, bytearray] = {}  # accumulated PCM across utterances
+        loop = asyncio.get_event_loop()
+        log.debug("STT worker started for guild %s", guild_id)
 
         try:
             while True:
-                user_id, pcm_bytes, enqueued_at, seq = await utterance_q.get()
+                user_id, pcm_bytes, enqueued_at, seq = await session.stt_queue.get()
+
                 log.debug(
-                    "Utterance received",
+                    "STT worker: received audio",
                     extra={"guild_id": guild_id, "user_id": user_id, "seq": seq},
                 )
 
-                # Always accumulate audio
-                if user_id not in user_audio:
-                    user_audio[user_id] = bytearray()
-                user_audio[user_id].extend(pcm_bytes)
+                display_name = self._resolve_display_name(guild_id, user_id)
 
-                # If there's an in-flight task that hasn't started TTS yet,
-                # cancel it — we'll restart with the combined audio.
-                old_task = user_tasks.get(user_id)
-                if old_task and not old_task.done():
-                    log.info(
-                        "New speech from user %s (seq=%d); cancelling in-flight pipeline to append",
-                        user_id,
-                        seq,
-                    )
-                    old_task.cancel()
-                    await asyncio.sleep(0)
-
-                # Start a new task with ALL accumulated audio for this user
-                combined_audio = bytes(user_audio[user_id])
-
-                # Create a wrapper that clears accumulated audio on success
-                async def _run_and_clear(
-                    uid: int = user_id,
-                    audio: bytes = combined_audio,
-                    eat: float = enqueued_at,
-                    s: int = seq,
-                ) -> None:
-                    await self._run_single_utterance(guild_id, vc, uid, audio, eat, s)
-                    # Pipeline completed (TTS played) — clear accumulated audio
-                    user_audio.pop(uid, None)
-
-                task = asyncio.create_task(
-                    _run_and_clear(),
-                    name=f"pipeline-{guild_id}-{user_id}-{seq}",
+                # Transcribe in executor (blocking Whisper HTTP call)
+                transcript = await loop.run_in_executor(
+                    None, pipeline.run_stt, pcm_bytes, str(user_id)
                 )
-                user_tasks[user_id] = task
 
-                # Clean up completed tasks to avoid memory growth
-                user_tasks = {uid: t for uid, t in user_tasks.items() if not t.done()}
+                if not transcript:
+                    log.debug(
+                        "STT: empty/hallucination (user=%s seq=%d)", user_id, seq
+                    )
+                    continue
 
-                utterance_q.task_done()
+                log.info(
+                    "Transcribed utterance",
+                    extra={
+                        "guild_id": guild_id,
+                        "user_id": user_id,
+                        "seq": seq,
+                        "transcript": transcript,
+                    },
+                )
+
+                # Append to conversation log (single source of truth)
+                entry = LogEntry(
+                    ts=time.monotonic(),
+                    kind="user_speech",
+                    speaker=display_name,
+                    text=transcript,
+                    meta={"seq": seq, "user_id": str(user_id)},
+                )
+                session.log.append(entry)
+
+                # Signal TTS cancel + wake LLM worker
+                session.tts_cancel.set()
+                session.pending_llm_trigger.set()
+
+                # Post transcript to Discord text channel
+                await self._post_to_channel(
+                    guild_id, f"🎙️ **{display_name}**: {transcript}"
+                )
 
         except asyncio.CancelledError:
-            log.debug("Utterance dispatcher cancelled for guild %s", guild_id)
-            # Cancel all in-flight user tasks on shutdown
-            for task in user_tasks.values():
-                if not task.done():
-                    task.cancel()
+            log.debug("STT worker cancelled for guild %s", guild_id)
+        except Exception as exc:
+            log.error("STT worker error for guild %s: %s", guild_id, exc, exc_info=True)
 
-    async def _run_single_utterance(
-        self,
-        guild_id: int,
-        vc: discord.VoiceClient,
-        user_id: int,
-        pcm_bytes: bytes,
-        enqueued_at: float,
-        seq: int,
-    ) -> None:
-        """Run the STT → LLM → TTS pipeline for a single user utterance.
+    async def _llm_worker(self, guild_id: int, session: VoiceSession) -> None:
+        """LLM worker: wait for trigger, call LLM, append response to log.
 
-        Checks response age before queuing playback. If cancelled (due to a
-        newer utterance arriving), exits cleanly without queuing audio.
-        Also posts a transcript summary to the configured transcript channel.
+        Never cancelled by new speech. Stale responses (log advanced while LLM
+        was running) are discarded and the worker re-triggers itself.
         """
         pipeline = self._pipelines.get(guild_id)
-        playback_q = self._playback_queues.get(guild_id)
-
-        if pipeline is None or playback_q is None:
-            log.error("Pipeline or playback queue gone for guild %s", guild_id)
+        if pipeline is None:
+            log.error("LLM worker started but no pipeline for guild %s", guild_id)
             return
 
-        display_name = self._resolve_display_name(guild_id, user_id)
-        bot_name = pipeline.config.bot_name
-        agent_name = pipeline.config.main_agent_name
+        loop = asyncio.get_event_loop()
+        log.debug("LLM worker started for guild %s", guild_id)
 
         try:
-            # ── Phase 1: STT + LLM (cancellable) ────────────────────────────
-            loop = asyncio.get_event_loop()
-            transcript, response_text = await loop.run_in_executor(
-                None,
-                pipeline.process_utterance,
-                pcm_bytes,
-                str(user_id),
-            )
+            while True:
+                # Wait for a new user_speech entry
+                await session.pending_llm_trigger.wait()
+                session.pending_llm_trigger.clear()
 
-            if not transcript:
-                return  # nothing heard
+                # Snapshot log version before the LLM call
+                _, pre_version = session.log.snapshot()
 
-            # Post user's speech to channel
-            await self._post_to_channel(
-                guild_id, f"🎙️ **{display_name}**: {transcript}"
-            )
+                # Build message list: system prompt + full conversation history
+                messages = [{"role": "system", "content": session.system_prompt}]
+                messages += session.log.to_messages()
 
-            if not response_text:
+                log.debug(
+                    "LLM worker: calling LLM",
+                    extra={
+                        "guild_id": guild_id,
+                        "messages": len(messages),
+                        "log_version": pre_version,
+                    },
+                )
+
+                # LLM call with tool support (blocking, run in executor)
+                response_text, escalation = await loop.run_in_executor(
+                    None, pipeline.call_llm_with_tools, messages
+                )
+
+                # Check if log advanced while LLM was running (new speech arrived)
+                _, post_version = session.log.snapshot()
+                if post_version > pre_version:
+                    log.info(
+                        "LLM response stale (log v%d → v%d), discarding",
+                        pre_version,
+                        post_version,
+                        extra={"guild_id": guild_id},
+                    )
+                    # STT worker already set pending_llm_trigger; loop back to wait
+                    continue
+
+                bot_name = pipeline.config.bot_name
+                agent_name = pipeline.config.main_agent_name
+
+                # Handle escalation tool call
+                if escalation:
+                    interim_text = f"Let me check with {agent_name} on that."
+                    entry = LogEntry(
+                        ts=time.monotonic(),
+                        kind="assistant",
+                        speaker=bot_name,
+                        text=interim_text,
+                    )
+                    session.log.append(entry)
+                    session.pending_tts.set()
+
+                    await self._post_to_channel(
+                        guild_id, f"🫖 **{bot_name}**: {interim_text}"
+                    )
+
+                    # Spawn escalation worker as independent task
+                    esc_id = f"esc-{time.monotonic():.3f}"
+                    esc_task = asyncio.create_task(
+                        self._escalation_worker(session, escalation, guild_id),
+                        name=f"escalation-{guild_id}-{esc_id}",
+                    )
+                    session.escalation_tasks[esc_id] = esc_task
+
+                    # Prune completed escalation tasks
+                    session.escalation_tasks = {
+                        k: t
+                        for k, t in session.escalation_tasks.items()
+                        if not t.done()
+                    }
+                    continue
+
+                if not response_text:
+                    log.warning(
+                        "LLM returned empty response for guild %s", guild_id
+                    )
+                    continue
+
+                # Append assistant entry to log and wake TTS worker
+                entry = LogEntry(
+                    ts=time.monotonic(),
+                    kind="assistant",
+                    speaker=bot_name,
+                    text=response_text,
+                )
+                session.log.append(entry)
+                session.pending_tts.set()
+
                 await self._post_to_channel(
-                    guild_id, f"🫖 **{bot_name}**: ⚠️ *(no response)*"
+                    guild_id, f"🫖 **{bot_name}**: {response_text}"
                 )
-                return
-
-            # ── Cancellation checkpoint ──────────────────────────────────────
-            # If a new utterance arrived while we were doing STT+LLM, this
-            # task will be cancelled HERE — before we waste time on TTS.
-            await asyncio.sleep(0)
-
-            # ── Response age guard ───────────────────────────────────────────
-            response_age_s = time.monotonic() - enqueued_at
-            if response_age_s > MAX_RESPONSE_AGE_S:
-                log.info(
-                    "Response discarded — too old (%.1fs) for user %s seq=%d",
-                    response_age_s, user_id, seq,
-                )
-                await self._post_to_channel(
-                    guild_id, f"🫖 **{bot_name}**: {response_text} ⚠️ *stale — not spoken*"
-                )
-                return
-
-            # ── Phase 2: TTS ─────────────────────────────────────────────────
-            response_audio = await loop.run_in_executor(
-                None,
-                pipeline.synthesize_response,
-                response_text,
-                str(user_id),
-            )
-
-            # Post Chip's response to channel
-            await self._post_to_channel(
-                guild_id, f"🫖 **{bot_name}**: {response_text}"
-            )
 
         except asyncio.CancelledError:
-            log.info(
-                "Pipeline task cancelled (user %s seq=%d) — newer utterance superseded it",
-                user_id, seq,
-            )
-            raise
-
+            log.debug("LLM worker cancelled for guild %s", guild_id)
         except Exception as exc:
-            log.error(
-                "Error in pipeline for guild %s user %s: %s",
-                guild_id, user_id, exc,
-            )
-            return
+            log.error("LLM worker error for guild %s: %s", guild_id, exc, exc_info=True)
 
-        if not response_audio:
-            return
+    async def _tts_worker(self, guild_id: int, session: VoiceSession) -> None:
+        """TTS worker: wait for signal, synthesise latest assistant entry, queue audio.
 
-        # ── Queue audio for playback ─────────────────────────────────────────
-        try:
-            playback_q.put_nowait(response_audio)
-        except asyncio.QueueFull:
-            log.warning(
-                "Playback queue full for guild %s, dropping response (user %s)",
-                guild_id, user_id,
-            )
-
-        # ── Escalation to Bel ────────────────────────────────────────────────
-        # Spawn as independent task so it survives cancellation from new speech
-        escalation = pipeline.last_escalation
-        if escalation:
-            asyncio.create_task(
-                self._handle_escalation(
-                    guild_id, vc, pipeline, playback_q, display_name, escalation
-                ),
-                name=f"escalation-{guild_id}-{user_id}",
-            )
-
-    async def _handle_escalation(
-        self,
-        guild_id: int,
-        vc: discord.VoiceClient,
-        pipeline,
-        playback_q: asyncio.Queue,
-        display_name: str,
-        escalation_request: str,
-    ) -> None:
-        """Send an escalation request to the main agent via OpenClaw gateway.
-
-        Runs the gateway call with a keepalive — if it takes longer than
-        KEEPALIVE_INTERVAL_S, synthesizes a "still thinking" message so the
-        user isn't left hanging.
+        This is the ONLY worker that gets interrupted by new speech.
+        Checks tts_cancel between synthesis and playback.
         """
-        KEEPALIVE_INTERVAL_S = 20
+        pipeline = self._pipelines.get(guild_id)
+        if pipeline is None:
+            log.error("TTS worker started but no pipeline for guild %s", guild_id)
+            return
+
+        loop = asyncio.get_event_loop()
+        log.debug("TTS worker started for guild %s", guild_id)
+
+        try:
+            while True:
+                # Wait for new TTS signal from LLM worker
+                await session.pending_tts.wait()
+                session.pending_tts.clear()
+                session.clear_tts_cancel()
+
+                # Get the latest assistant entry from the log
+                entries, _ = session.log.snapshot()
+                assistant_entries = [e for e in entries if e.kind == "assistant"]
+                if not assistant_entries:
+                    continue
+                text = assistant_entries[-1].text
+
+                log.debug(
+                    "TTS worker: synthesising response",
+                    extra={"guild_id": guild_id, "text_preview": text[:60]},
+                )
+
+                # Synthesise in executor (blocking TTS HTTP call)
+                audio = await loop.run_in_executor(
+                    None, pipeline.synthesize_response, text
+                )
+
+                # Check if new speech arrived during synthesis
+                if session.tts_cancel.is_set():
+                    session.clear_tts_cancel()
+                    log.info(
+                        "TTS cancelled by new speech for guild %s", guild_id
+                    )
+                    continue
+
+                if not audio:
+                    log.warning("TTS returned empty audio for guild %s", guild_id)
+                    continue
+
+                # Queue for playback
+                try:
+                    session.playback_queue.put_nowait(audio)
+                except asyncio.QueueFull:
+                    log.warning(
+                        "Playback queue full for guild %s, dropping TTS audio", guild_id
+                    )
+
+        except asyncio.CancelledError:
+            log.debug("TTS worker cancelled for guild %s", guild_id)
+        except Exception as exc:
+            log.error("TTS worker error for guild %s: %s", guild_id, exc, exc_info=True)
+
+    async def _escalation_worker(
+        self,
+        session: VoiceSession,
+        request_text: str,
+        guild_id: int,
+    ) -> None:
+        """Escalation worker: call main agent via gateway, feed result back to log.
+
+        Runs to completion (or 120s timeout). Never cancelled by new speech.
+        Every 20s sends a keepalive audio message to the voice channel.
+        On response: appends escalation_result → sets pending_llm_trigger so
+        the LLM generates a natural spoken response.
+        """
+        pipeline = self._pipelines.get(guild_id)
+        if pipeline is None:
+            log.warning("Escalation worker: no pipeline for guild %s", guild_id)
+            return
 
         bot_name = pipeline.config.bot_name
         agent_name = pipeline.config.main_agent_name
+        loop = asyncio.get_event_loop()
+
+        log.info(
+            "Escalation worker started",
+            extra={"guild_id": guild_id, "request": request_text[:80]},
+        )
 
         try:
+            # Post escalation notice to channel
             await self._post_to_channel(
                 guild_id,
-                f"🫖 **{bot_name} → {agent_name}**: {escalation_request}",
+                f"🫖 **{bot_name} → {agent_name}**: {request_text}",
             )
 
-            # Run gateway call with keepalive loop
+            # Start gateway task
             gateway_task = asyncio.create_task(
-                self._send_to_bel(escalation_request, display_name, guild_id)
+                self._send_to_bel(request_text, "voice user", guild_id)
             )
 
-            keepalive_count = 0
             keepalive_messages = [
                 f"{agent_name}'s thinking about that, one moment.",
                 f"Still waiting on {agent_name}, hang tight.",
                 f"{agent_name}'s taking a bit — still working on it.",
             ]
+            keepalive_count = 0
+            elapsed_s = 0
+            bel_response: str | None = None
 
-            while not gateway_task.done():
+            while elapsed_s < ESCALATION_MAX_WAIT_S:
                 try:
                     bel_response = await asyncio.wait_for(
-                        asyncio.shield(gateway_task), timeout=KEEPALIVE_INTERVAL_S
+                        asyncio.shield(gateway_task),
+                        timeout=ESCALATION_KEEPALIVE_S,
                     )
                     break  # Got a response
                 except asyncio.TimeoutError:
-                    # Gateway still working — send keepalive
+                    elapsed_s += ESCALATION_KEEPALIVE_S
                     keepalive_count += 1
-                    msg = keepalive_messages[
+                    keepalive_text = keepalive_messages[
                         min(keepalive_count - 1, len(keepalive_messages) - 1)
                     ]
                     log.info(
                         "Escalation keepalive #%d for guild %s", keepalive_count, guild_id
                     )
-                    loop = asyncio.get_event_loop()
+
+                    # Append keepalive to log (context for LLM)
+                    session.log.append(
+                        LogEntry(
+                            ts=time.monotonic(),
+                            kind="system",
+                            speaker="system",
+                            text=f"Still waiting for {agent_name}...",
+                        )
+                    )
+
+                    # Synthesise and queue keepalive audio
                     audio = await loop.run_in_executor(
-                        None, pipeline.synthesize_response, msg,
+                        None, pipeline.synthesize_response, keepalive_text
                     )
                     if audio:
-                        try:
-                            playback_q.put_nowait(audio)
-                        except asyncio.QueueFull:
-                            pass
+                        with contextlib.suppress(asyncio.QueueFull):
+                            session.playback_queue.put_nowait(audio)
 
-                    if keepalive_count >= 4:
-                        # Give up after ~80s
-                        gateway_task.cancel()
-                        bel_response = None
-                        break
-            else:
-                bel_response = gateway_task.result()
+            # If still running past timeout, cancel and grab any partial result
+            if not gateway_task.done():
+                gateway_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await gateway_task
+            elif not gateway_task.cancelled():
+                try:
+                    bel_response = bel_response or gateway_task.result()
+                except Exception as exc:
+                    log.warning("Gateway task raised exception: %s", exc)
 
-            # Truncate long responses
+            # Truncate very long responses
             if bel_response and len(bel_response) > 1500:
                 bel_response = bel_response[:1500] + "..."
 
@@ -791,57 +910,45 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
                     guild_id,
                     f"🔔 **{agent_name} → {bot_name}**: ⚠️ *(no response — may be busy)*",
                 )
-                loop = asyncio.get_event_loop()
-                audio = await loop.run_in_executor(
-                    None,
-                    pipeline.synthesize_response,
-                    f"Sorry, I couldn't reach {agent_name} right now. Try again in a moment.",
+                # Append fallback result so LLM can acknowledge the failure
+                session.log.append(
+                    LogEntry(
+                        ts=time.monotonic(),
+                        kind="escalation_result",
+                        speaker=agent_name,
+                        text=f"No response from {agent_name} — may be unavailable right now.",
+                    )
                 )
-                if audio:
-                    try:
-                        playback_q.put_nowait(audio)
-                    except asyncio.QueueFull:
-                        pass
+                session.pending_llm_trigger.set()
                 return
 
-            # Post Bel's response to channel
-            bel_display = bel_response[:1800] if len(bel_response) > 1800 else bel_response
+            # Post response to Discord
+            display_text = bel_response[:1800] if len(bel_response) > 1800 else bel_response
             await self._post_to_channel(
-                guild_id, f"🔔 **{agent_name} → {bot_name}**: {bel_display}"
+                guild_id, f"🔔 **{agent_name} → {bot_name}**: {display_text}"
             )
 
-            # Rephrase for speech and synthesize
-            loop = asyncio.get_event_loop()
-            spoken_response = await loop.run_in_executor(
-                None, self._rephrase_for_speech, pipeline, bel_response,
-            )
-
-            audio = await loop.run_in_executor(
-                None, pipeline.synthesize_response, spoken_response,
-            )
-
-            if audio:
-                await self._post_to_channel(
-                    guild_id, f"🫖 **{bot_name}**: {spoken_response}"
+            # Append escalation_result to log → trigger LLM to generate spoken response
+            session.log.append(
+                LogEntry(
+                    ts=time.monotonic(),
+                    kind="escalation_result",
+                    speaker=agent_name,
+                    text=bel_response,
                 )
-                try:
-                    playback_q.put_nowait(audio)
-                except asyncio.QueueFull:
-                    pass
+            )
+            session.pending_llm_trigger.set()
 
+        except asyncio.CancelledError:
+            log.debug("Escalation worker cancelled for guild %s", guild_id)
         except Exception as exc:
-            log.error("Escalation handler error for guild %s: %s", guild_id, exc)
-            try:
-                loop = asyncio.get_event_loop()
-                audio = await loop.run_in_executor(
-                    None,
-                    pipeline.synthesize_response,
-                    f"Sorry, something went wrong with the escalation.",
-                )
-                if audio:
-                    playback_q.put_nowait(audio)
-            except Exception:
-                pass
+            log.error(
+                "Escalation worker error for guild %s: %s", guild_id, exc, exc_info=True
+            )
+
+    # ------------------------------------------------------------------
+    # Gateway (escalation send)
+    # ------------------------------------------------------------------
 
     async def _send_to_bel(self, request: str, user_name: str, guild_id: int = 0) -> str | None:
         """Send a request to Bel via the OpenClaw gateway WebSocket.
@@ -876,34 +983,61 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
         )
         return await send_to_bel(message, timeout_s=90.0)
 
-    def _rephrase_for_speech(self, pipeline, bel_response: str) -> str:
-        """Use the LLM to rephrase the main agent's response for natural speech."""
-        agent_name = pipeline.config.main_agent_name
-        bot_name = pipeline.config.bot_name
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    f"You are {bot_name}. {agent_name} (the main AI agent) sent you a response to relay "
-                    f"to the user via voice. Rephrase it naturally for speech — short, "
-                    f"warm, conversational. 1-2 sentences max. Don't mention {agent_name} — "
-                    f"just deliver the information naturally. /no_think"
-                ),
-            },
-            {
-                "role": "user",
-                "content": f"{agent_name}'s response to relay: {bel_response}",
-            },
-        ]
+    # ------------------------------------------------------------------
+    # Playback worker
+    # ------------------------------------------------------------------
 
-        result = pipeline._call_openai_compat(messages)
-        if isinstance(result, str) and result:
-            # Strip think tags
-            if "<think>" in result:
-                import re
-                result = re.sub(r"<think>.*?</think>", "", result, flags=re.DOTALL).strip()
-            return result
-        return bel_response  # fallback: use Bel's raw response
+    async def _playback_worker(
+        self,
+        guild_id: int,
+        session: VoiceSession,
+        vc: discord.VoiceClient,
+    ) -> None:
+        """Play audio responses from session.playback_queue into the voice channel."""
+        log.debug("Playback worker started for guild %s", guild_id)
+
+        while True:
+            try:
+                wav_bytes = await session.playback_queue.get()
+
+                if not vc.is_connected():
+                    log.debug("Voice client disconnected, dropping playback")
+                    session.playback_queue.task_done()
+                    continue
+
+                # Write WAV to a temp file for FFmpeg
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+                    tf.write(wav_bytes)
+                    tmp_path = tf.name
+
+                try:
+                    # Wait for any current playback to finish
+                    while vc.is_playing():
+                        await asyncio.sleep(0.1)
+
+                    source = discord.FFmpegPCMAudio(tmp_path)
+                    vc.play(source)
+
+                    # Wait for playback to complete
+                    while vc.is_playing():
+                        await asyncio.sleep(0.1)
+
+                except Exception as exc:
+                    log.error("Playback error for guild %s: %s", guild_id, exc)
+                finally:
+                    Path(tmp_path).unlink(missing_ok=True)
+
+                session.playback_queue.task_done()
+
+            except asyncio.CancelledError:
+                log.debug("Playback worker cancelled for guild %s", guild_id)
+                break
+            except Exception as exc:
+                log.error("Unexpected playback error for guild %s: %s", guild_id, exc)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
     def _resolve_display_name(self, guild_id: int, user_id: int | str) -> str:
         """Resolve a Discord user ID to their display name."""
@@ -936,56 +1070,13 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
         except Exception as exc:
             log.warning("Failed to post to channel %s: %s", channel_id, exc)
 
-    async def _playback_worker(
-        self,
-        guild_id: int,
-        vc: discord.VoiceClient,
-    ) -> None:
-        """Play audio responses from the playback queue."""
-        playback_q = self._playback_queues.get(guild_id)
-        if playback_q is None:
-            return
+    def _rephrase_for_speech(self, pipeline: VoicePipeline, bel_response: str) -> str:
+        """Use the LLM to rephrase the main agent's response for natural speech.
 
-        log.debug("Playback worker started for guild %s", guild_id)
-
-        while True:
-            try:
-                wav_bytes = await playback_q.get()
-
-                if not vc.is_connected():
-                    log.debug("Voice client disconnected, dropping playback")
-                    playback_q.task_done()
-                    continue
-
-                # Write WAV to a temp file for FFmpeg
-                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
-                    tf.write(wav_bytes)
-                    tmp_path = tf.name
-
-                try:
-                    # Wait for any current playback to finish
-                    while vc.is_playing():
-                        await asyncio.sleep(0.1)
-
-                    source = discord.FFmpegPCMAudio(tmp_path)
-                    vc.play(source)
-
-                    # Wait for playback to complete
-                    while vc.is_playing():
-                        await asyncio.sleep(0.1)
-
-                except Exception as exc:
-                    log.error("Playback error for guild %s: %s", guild_id, exc)
-                finally:
-                    Path(tmp_path).unlink(missing_ok=True)
-
-                playback_q.task_done()
-
-            except asyncio.CancelledError:
-                log.debug("Playback worker cancelled for guild %s", guild_id)
-                break
-            except Exception as exc:
-                log.error("Unexpected playback error for guild %s: %s", guild_id, exc)
+        Delegates to the pipeline's own rephrase_for_speech() method which
+        handles the LLM call and think-tag stripping.
+        """
+        return pipeline.rephrase_for_speech(bel_response)
 
 
 # ---------------------------------------------------------------------------

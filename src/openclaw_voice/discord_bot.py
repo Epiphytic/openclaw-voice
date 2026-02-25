@@ -498,7 +498,22 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
                 log.warning("Failed to summarize channel message: %s", exc)
                 content = " ".join(content.split()[:250]) + "…"
 
-        tts_text = content
+        # Identify other speakers, but not ourselves (Chip = belthanior to the user)
+        # The OpenClaw bot (belthanior) posts Bel's responses — same entity from
+        # the user's perspective, so no attribution needed.
+        main_agent_name = self._pipeline_config.main_agent_name.lower()
+        author_name_lower = display_name.lower()
+        is_self = (
+            author_name_lower == main_agent_name
+            or author_name_lower == self._pipeline_config.bot_name.lower()
+            or author_name_lower in ("belthanior", "bel")
+        )
+        if is_self:
+            # Strip any emoji/bold prefix like "🜂 **Bel**: " from the content
+            import re as _re
+            tts_text = _re.sub(r'^[^\w]*\*\*\w+\*\*:\s*', '', content).strip() or content
+        else:
+            tts_text = f"{display_name} says: {content}"
 
         log.info(
             "Text-to-voice bridge: reading channel message",

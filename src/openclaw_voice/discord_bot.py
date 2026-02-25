@@ -911,7 +911,7 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
 
                 # Handle escalation tool call
                 if escalation:
-                    interim_text = f"Let me check with {agent_name} on that."
+                    interim_text = "One moment."
                     entry = LogEntry(
                         ts=time.monotonic(),
                         kind="assistant",

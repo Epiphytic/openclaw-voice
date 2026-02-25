@@ -142,6 +142,12 @@ class PipelineConfig:
     # Loaded correction map (populated by __post_init__)
     _corrections: dict[str, str] = field(default_factory=dict, repr=False)
 
+    # Text channel context injection into LLM prompts
+    channel_context_messages: int = 10
+
+    # Text-to-voice bridge: read aloud messages posted to the linked text channel
+    tts_read_channel: bool = True
+
     def __post_init__(self) -> None:
         """Load corrections from TOML file if configured."""
         if self.corrections_file:

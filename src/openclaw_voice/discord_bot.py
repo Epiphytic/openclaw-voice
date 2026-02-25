@@ -407,6 +407,92 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
                             (uid_int, utterance, time.monotonic(), sink._user_seqs[uid_int])
                         )
 
+    async def on_message(self, message: discord.Message) -> None:
+        """Bridge text channel messages to voice TTS.
+
+        When someone posts in the linked text channel while a voice session is
+        active, synthesise the message and queue it for playback — so voice
+        participants hear what's typed in the text channel.
+
+        Conditions to read aloud:
+          - Active voice session in the guild
+          - Message is in the linked text channel (where /join was invoked)
+          - Author is not a bot (any bot, including Chip itself)
+          - Message has non-empty text content
+          - tts_read_channel is enabled in pipeline config
+        """
+        # Must be a guild message
+        if not message.guild:
+            return
+
+        guild_id = message.guild.id
+        session = self._sessions.get(guild_id)
+        if session is None:
+            return
+
+        # Must match the linked text channel
+        text_channel_id = self._guild_text_channels.get(guild_id)
+        if not text_channel_id or message.channel.id != text_channel_id:
+            return
+
+        # Skip all bot messages (any bot, not just Chip)
+        if message.author.bot:
+            return
+
+        content = message.content.strip()
+        if not content:
+            return
+
+        pipeline = self._pipelines.get(guild_id)
+        if pipeline is None:
+            return
+
+        if not pipeline.config.tts_read_channel:
+            return
+
+        loop = asyncio.get_event_loop()
+        display_name = message.author.display_name
+        word_count = len(content.split())
+
+        # Summarize long messages via LLM so TTS stays concise
+        if word_count > 250:
+            try:
+                summary_messages = [
+                    {
+                        "role": "system",
+                        "content": (
+                            "Summarize the following message in 2 sentences. "
+                            "Be concise and factual. /no_think"
+                        ),
+                    },
+                    {"role": "user", "content": content},
+                ]
+                summary = await loop.run_in_executor(
+                    None, pipeline._call_openai_compat, summary_messages
+                )
+                if summary and isinstance(summary, str):
+                    content = summary.strip()
+                else:
+                    # Fallback: truncate to first 250 words
+                    content = " ".join(content.split()[:250]) + "…"
+            except Exception as exc:
+                log.warning("Failed to summarize channel message: %s", exc)
+                content = " ".join(content.split()[:250]) + "…"
+
+        tts_text = f"{display_name} says: {content}"
+
+        log.info(
+            "Text-to-voice bridge: reading channel message",
+            extra={"guild_id": guild_id, "author": display_name, "words": word_count},
+        )
+
+        audio = await loop.run_in_executor(
+            None, pipeline.synthesize_response, tts_text
+        )
+        if audio:
+            with contextlib.suppress(asyncio.QueueFull):
+                session.playback_queue.put_nowait((audio, None))
+
     # ------------------------------------------------------------------
     # Slash commands
     # ------------------------------------------------------------------
@@ -735,8 +821,40 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
                 # Snapshot log version before the LLM call
                 _, pre_version = session.log.snapshot()
 
+                # Inject recent text channel messages into the system prompt
+                system_content = session.system_prompt
+                n_ctx = pipeline.config.channel_context_messages
+                if n_ctx > 0:
+                    text_channel_id = self._guild_text_channels.get(guild_id)
+                    if text_channel_id:
+                        try:
+                            text_channel = self.get_channel(text_channel_id)
+                            if text_channel:
+                                ctx_lines: list[str] = []
+                                async for msg in text_channel.history(limit=n_ctx):
+                                    if msg.author.bot:
+                                        continue
+                                    if msg.content:
+                                        ctx_lines.append(
+                                            f"{msg.author.display_name}: {msg.content}"
+                                        )
+                                ctx_lines.reverse()  # chronological order
+                                if ctx_lines:
+                                    header = f"[Text channel context — last {n_ctx} messages]"
+                                    system_content = (
+                                        session.system_prompt
+                                        + f"\n\n{header}\n"
+                                        + "\n".join(ctx_lines)
+                                    )
+                        except Exception as _ctx_exc:
+                            log.warning(
+                                "Failed to fetch channel context for guild %s: %s",
+                                guild_id,
+                                _ctx_exc,
+                            )
+
                 # Build message list: system prompt + full conversation history
-                messages = [{"role": "system", "content": session.system_prompt}]
+                messages = [{"role": "system", "content": system_content}]
                 messages += session.log.to_messages()
 
                 log.debug(
@@ -1024,13 +1142,23 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
         if text_channel_id:
             context_parts.append(f"Text channel ID: {text_channel_id}")
 
+        # Build the instruction block, including channel-post directive if available
+        instructions = (
+            "Your response will be spoken aloud via TTS — keep it SHORT "
+            "(1-3 sentences), no markdown, no links, no code blocks.\n"
+            "Do NOT say NO_REPLY — always respond with text for the voice user."
+        )
+        if text_channel_id:
+            instructions += (
+                f"\nAlso post your full response as a Discord message to channel "
+                f"{text_channel_id} so text participants can read it."
+            )
+
         message = (
             f"{' | '.join(context_parts)}\n"
             f"{user_name} asked via voice: {request}\n\n"
             f"INSTRUCTIONS:\n"
-            f"Your response will be spoken aloud via TTS — keep it SHORT "
-            f"(1-3 sentences), no markdown, no links, no code blocks.\n"
-            f"Do NOT say NO_REPLY — always respond with text for the voice user."
+            f"{instructions}"
         )
         return await send_to_bel(message, timeout_s=90.0)
 
@@ -1244,6 +1372,8 @@ def create_bot(
 
     intents = discord.Intents.default()
     intents.voice_states = True
+    intents.message_content = True  # required for reading message text in on_message
+    intents.messages = True  # receive guild message events
 
     return VoiceBot(
         pipeline_config=pipeline_config,

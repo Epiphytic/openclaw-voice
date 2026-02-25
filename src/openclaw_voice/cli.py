@@ -568,6 +568,8 @@ def discord_bot_cmd(
         extra_context=cfg_file.get("extra_context", ""),
         whisper_prompt=cfg_file.get("whisper_prompt", ""),
         corrections_file=cfg_file.get("corrections_file", ""),
+        channel_context_messages=int(cfg_file.get("channel_context_messages", 10)),
+        tts_read_channel=bool(cfg_file.get("tts_read_channel", True)),
     )
 
     # Resolve VAD and transcript settings (CLI > env > config file > defaults)

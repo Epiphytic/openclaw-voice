@@ -59,6 +59,31 @@ def _load_toml_config(path: Path) -> dict:
         return {}
 
 
+def _load_openclaw_config() -> dict:
+    """Load voice config from the main OpenClaw config (~/.openclaw/openclaw.json).
+
+    Looks for a ``voice`` key in the top-level config.  Returns the dict
+    or empty dict if not found.
+    """
+    import json as _json
+
+    candidates = [
+        Path.home() / ".openclaw" / "openclaw.json",
+        Path(os.environ.get("OPENCLAW_HOME", "")) / "openclaw.json",
+    ]
+    for p in candidates:
+        if p.is_file():
+            try:
+                data = _json.loads(p.read_text())
+                voice_cfg = data.get("voice", {})
+                if voice_cfg:
+                    log.debug("Loaded voice config from %s", p)
+                    return voice_cfg
+            except Exception as exc:
+                log.debug("Could not read voice config from %s: %s", p, exc)
+    return {}
+
+
 def _env(key: str, default: str | None = None) -> str | None:
     """Read an environment variable with the OPENCLAW_VOICE_ prefix."""
     return os.environ.get(f"OPENCLAW_VOICE_{key.upper()}", default)
@@ -486,6 +511,12 @@ def discord_bot_cmd(
     if config:
         cfg_file = _load_toml_config(Path(config)).get("discord", {})
 
+    # Also check OpenClaw config for a [voice] section as fallback
+    if not cfg_file:
+        openclaw_cfg = _load_openclaw_config()
+        if openclaw_cfg:
+            cfg_file = openclaw_cfg
+
     # Resolve token (CLI > env > config file)
     resolved_token = token or cfg_file.get("token")
     if not resolved_token:
@@ -510,17 +541,32 @@ def discord_bot_cmd(
         create_bot,
     )
 
+    # Config file values override CLI defaults (CLI explicit flags still win
+    # via env vars, but when --config is given, its values take precedence
+    # over hardcoded click defaults).
+    def _resolve(cli_val, key: str, fallback=None):
+        """Config file wins over CLI default; explicit CLI/env wins over config."""
+        cfg_val = cfg_file.get(key)
+        if cfg_val is not None:
+            return cfg_val
+        return cli_val if cli_val is not None else fallback
+
     pipeline_config = PipelineConfig(
-        whisper_url=whisper_url or cfg_file.get("whisper_url", "http://localhost:8001/inference"),
-        kokoro_url=kokoro_url
-        or cfg_file.get("kokoro_url", "http://localhost:8002/v1/audio/speech"),
-        llm_url=llm_url or cfg_file.get("llm_url", "http://localhost:8000/v1/chat/completions"),
-        llm_model=llm_model or cfg_file.get("llm_model", "Qwen/Qwen2.5-32B-Instruct"),
-        tts_voice=tts_voice or cfg_file.get("tts_voice", "af_heart"),
-        enable_speaker_id=speaker_id or cfg_file.get("enable_speaker_id", False),
-        speaker_id_url=speaker_id_url
-        or cfg_file.get("speaker_id_url", "http://localhost:8003/identify"),
-        max_history_turns=max_history or cfg_file.get("max_history_turns", 20),
+        whisper_url=_resolve(whisper_url, "whisper_url", "http://localhost:8001/inference"),
+        kokoro_url=_resolve(kokoro_url, "kokoro_url", "http://localhost:8002/v1/audio/speech"),
+        llm_url=_resolve(llm_url, "llm_url", "http://localhost:8000/v1/chat/completions"),
+        llm_model=_resolve(llm_model, "llm_model", "Qwen/Qwen2.5-32B-Instruct"),
+        tts_voice=_resolve(tts_voice, "tts_voice", "af_heart"),
+        enable_speaker_id=_resolve(speaker_id, "enable_speaker_id", False),
+        speaker_id_url=_resolve(speaker_id_url, "speaker_id_url", "http://localhost:8003/identify"),
+        max_history_turns=_resolve(max_history, "max_history_turns", 20),
+        # Identity & context from config file (not hardcoded)
+        bot_name=cfg_file.get("bot_name", "Assistant"),
+        main_agent_name=cfg_file.get("main_agent_name", "main agent"),
+        default_location=cfg_file.get("default_location", ""),
+        default_timezone=cfg_file.get("default_timezone", "UTC"),
+        extra_context=cfg_file.get("extra_context", ""),
+        whisper_prompt=cfg_file.get("whisper_prompt", ""),
     )
 
     # Resolve VAD and transcript settings (CLI > env > config file > defaults)

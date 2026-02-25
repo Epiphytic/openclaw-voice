@@ -363,7 +363,7 @@ class VoicePipeline:
                     "checking the channel",
                     "checking with",
                     "check with bel",
-                    "check with " + self.main_agent_name.lower(),
+                    "check with " + self._config.main_agent_name.lower(),
                 ]
                 if any(phrase in text_lower for phrase in fallback_triggers):
                     log.info(

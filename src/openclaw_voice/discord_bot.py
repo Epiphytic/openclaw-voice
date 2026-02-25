@@ -891,7 +891,12 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
                 )
             )
 
-            # TTS render directly — no rephrase, no channel post
+            # Post Bel's response to the text channel so users have a text record
+            await self._post_to_channel(
+                guild_id, f"🜂 **{agent_name}**: {bel_response}"
+            )
+
+            # TTS render directly — no rephrase
             audio = await loop.run_in_executor(
                 None, pipeline.synthesize_response, tts_text
             )
@@ -943,11 +948,9 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
             f"{' | '.join(context_parts)}\n"
             f"{user_name} asked via voice: {request}\n\n"
             f"INSTRUCTIONS:\n"
-            f"1. Post your response to the Discord channel (ID: {text_channel_id or 'unknown'}) "
-            f"so the user can see it in text.\n"
-            f"2. Your response text will ALSO be spoken aloud via TTS — keep it SHORT "
+            f"Your response will be spoken aloud via TTS — keep it SHORT "
             f"(1-3 sentences), no markdown, no links, no code blocks.\n"
-            f"3. Do NOT say NO_REPLY — always respond with text for the voice user."
+            f"Do NOT say NO_REPLY — always respond with text for the voice user."
         )
         return await send_to_bel(message, timeout_s=90.0)
 

@@ -139,6 +139,7 @@ class KokoroEventHandler(AsyncEventHandler):
             TtsVoice(
                 name=name,
                 description=f"Kokoro voice: {name}",
+                version="1.0",
                 attribution=Attribution(
                     name="Kokoro TTS",
                     url="https://github.com/hexgrad/kokoro",
@@ -153,6 +154,7 @@ class KokoroEventHandler(AsyncEventHandler):
                 TtsProgram(
                     name="kokoro",
                     description="Kokoro TTS (openclaw-voice bridge)",
+                    version="0.1.0",
                     attribution=Attribution(
                         name="Kokoro TTS",
                         url="https://github.com/hexgrad/kokoro",

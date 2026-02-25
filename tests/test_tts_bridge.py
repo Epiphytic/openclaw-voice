@@ -173,8 +173,8 @@ class TestKokoroEventHandlerSynthesize:
             await handler._handle_synthesize(synth)
 
         types = [e.type for e in written_events]
-        assert AudioStart.type in types
-        assert AudioChunk.type in types
-        assert AudioStop.type in types
+        assert any(AudioStart.is_type(t) for t in types)
+        assert any(AudioChunk.is_type(t) for t in types)
+        assert any(AudioStop.is_type(t) for t in types)
         # AudioStop should be last
-        assert written_events[-1].type == AudioStop.type
+        assert AudioStop.is_type(written_events[-1].type)

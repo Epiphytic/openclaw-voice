@@ -32,7 +32,7 @@ TOOL_DEFINITIONS = [
                 "properties": {
                     "location": {
                         "type": "string",
-                        "description": "City name, e.g. 'Ladysmith, Canada' or 'Vancouver BC'",
+                        "description": "City name, e.g. 'Seattle, US' or 'Vancouver BC'",
                     },
                 },
                 "required": ["location"],

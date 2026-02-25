@@ -60,7 +60,7 @@ graph LR
 2. **Audio Stream**: HA opens a connection to STT Bridge (port 10300).
 3. **Transcription**: STT Bridge sends audio to Whisper.
 4. **Identification**: Simultaneously, STT Bridge sends audio to Speaker ID.
-5. **Response**: STT Bridge merges text and speaker info: `[speaker:Liam] Turn on the lights.`
+5. **Response**: STT Bridge merges text and speaker info: `[speaker:Alice] Turn on the lights.`
 6. **Intent**: HA processes the text intent.
 7. **Response Generation**: HA sends text response to TTS Bridge (port 10200).
 8. **Synthesis**: TTS Bridge generates audio via Kokoro and streams it back to the satellite.

@@ -294,10 +294,10 @@ manual process start                 # no lifecycle management
           "llmModel": "Qwen/Qwen3-30B-A3B-Instruct-2507",
           "botName": "Chip",
           "mainAgentName": "Bel",
-          "defaultLocation": "Cassidy, BC, Canada",
+          "defaultLocation": "Your City, Province, Country",
           "defaultTimezone": "America/Vancouver",
-          "extraContext": "You're on a farm on Vancouver Island. The primary user is Liam.",
-          "whisperPrompt": "Chip, Bel, Liam, Cassidy, Ladysmith, Vancouver Island"
+          "extraContext": "Custom context about your environment and primary user.",
+          "whisperPrompt": "Custom vocabulary hints for Whisper transcription"
         }
       }
     }
@@ -346,12 +346,12 @@ manual process start                 # no lifecycle management
 14. Remove `gateway_client.py`
 15. Remove device identity generation
 16. Update README, MANIFEST.md
-17. Publish to npm as `@openclaw/discord-voice` (or `@epiphytic/openclaw-discord-voice`)
+17. Publish to npm as `@epiphytic/openclaw-discord-voice`
 
-## Open Questions
+## Decisions (resolved)
 
-1. **npm scope** — `@openclaw/discord-voice` (official) or `@epiphytic/openclaw-discord-voice` (community)?
-2. **Python path discovery** — should the plugin auto-detect venv, or require explicit `pythonPath`?
-3. **Token handling** — `file://` URI for token files, or OpenClaw's auth profile system?
-4. **Streaming escalation** — HTTP POST is request/response. For keepalive messages during long escalation, should the plugin push SSE events back to the Python process, or should the Python process poll?
-5. **Multi-guild** — one Python process per guild, or one process serving all guilds? (Current: one process, all guilds)
+1. **npm scope** — `@epiphytic/openclaw-discord-voice` (community/Epiphytic org)
+2. **Python path discovery** — auto-detect venv (search common locations, check PATH) unless explicit `pythonPath` provided in config
+3. **Token handling** — via OpenClaw's auth/plugin config system (no raw file paths in config)
+4. **Streaming escalation** — push model preferred. Plugin pushes SSE events to Python process for keepalive/progress during long escalations. Fallback to polling if SSE adds too much complexity.
+5. **Multi-guild** — one Python process per guild. Extra process overhead is cheap; isolation is worth it (crash in one guild doesn't affect others, independent conversation logs, cleaner resource accounting).

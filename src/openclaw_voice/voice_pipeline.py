@@ -137,7 +137,7 @@ class PipelineConfig:
     # Identity & context (loaded from config file, not hardcoded)
     bot_name: str = "Assistant"
     main_agent_name: str = "main agent"
-    default_location: str = ""  # e.g. "Cassidy, BC, Canada"
+    default_location: str = ""  # e.g. "Seattle, WA, USA"
     default_timezone: str = "UTC"
     extra_context: str = ""  # freeform context appended to system prompt
 

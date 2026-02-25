@@ -15,7 +15,7 @@ on each append, enabling efficient change detection by workers.
 Usage::
 
     log = ConversationLog()
-    entry = LogEntry(ts=time.monotonic(), kind="user_speech", speaker="Liam", text="Hey Chip")
+    entry = LogEntry(ts=time.monotonic(), kind="user_speech", speaker="Alice", text="Hey Assistant")
     version = log.append(entry)
     entries, version = log.snapshot()
     messages = log.to_messages()    # OpenAI chat format

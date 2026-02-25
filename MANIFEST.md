@@ -24,6 +24,10 @@
 | `run_stt_bridge()` | `src/openclaw_voice/stt_bridge.py` | Runs the Wyoming STT bridge (whisper.cpp backend). | `wyoming`, `httpx` | N (Long-running) |
 | `run_tts_bridge()` | `src/openclaw_voice/tts_bridge.py` | Runs the Wyoming TTS bridge (Kokoro backend). | `wyoming`, `httpx` | N (Long-running) |
 | `run_speaker_id()` | `src/openclaw_voice/speaker_id.py` | Runs the Speaker ID HTTP server (Resemblyzer backend). | `fastapi`, `uvicorn` | N (Long-running) |
+| `VoiceActivityDetector` | `src/openclaw_voice/vad.py` | VAD class: segments 16kHz int16 mono PCM audio into utterances using webrtcvad. Configurable aggressiveness and silence threshold. | `webrtcvad` | Y |
+| `VoicePipeline` | `src/openclaw_voice/voice_pipeline.py` | Orchestrates STT → LLM → TTS pipeline for Discord voice. Maintains per-channel conversation history. | `httpx`, `WhisperFacade`, `KokoroFacade` | N (stateful) |
+| `VoiceBot` | `src/openclaw_voice/discord_bot.py` | Discord voice channel bot (py-cord). Slash commands: /join, /leave, /voice. Per-user VAD + VoicePipeline per guild. | `py-cord[voice]`, `PyNaCl`, `VoicePipeline`, `VoiceActivityDetector` | N (Long-running) |
+| `create_bot()` | `src/openclaw_voice/discord_bot.py` | Factory function for VoiceBot with sane intents defaults. | `py-cord` | Y |
 
 ---
 

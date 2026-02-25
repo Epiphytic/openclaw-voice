@@ -385,5 +385,137 @@ def all_cmd(
         log.info("Shutting down")
 
 
+# ---------------------------------------------------------------------------
+# discord-bot sub-command
+# ---------------------------------------------------------------------------
+
+
+@main.command("discord-bot")
+@_config_option
+@_log_level_option
+@click.option(
+    "--token",
+    default=lambda: _env("DISCORD_TOKEN"),
+    help="Discord bot token (or OPENCLAW_VOICE_DISCORD_TOKEN env var)",
+    show_default=False,
+)
+@click.option(
+    "--guild-id",
+    default=lambda: _env("GUILD_ID"),
+    type=str,
+    multiple=True,
+    help="Guild ID(s) for slash command registration (repeatable; omit for global)",
+)
+@click.option(
+    "--whisper-url",
+    default=lambda: _env("WHISPER_URL", "http://localhost:8001/inference"),
+    help="whisper.cpp /inference endpoint",
+)
+@click.option(
+    "--kokoro-url",
+    default=lambda: _env("KOKORO_URL", "http://localhost:8002/v1/audio/speech"),
+    help="Kokoro /v1/audio/speech endpoint",
+)
+@click.option(
+    "--llm-url",
+    default=lambda: _env("LLM_URL", "http://localhost:8000/v1/chat/completions"),
+    help="OpenAI-compatible LLM /v1/chat/completions endpoint",
+)
+@click.option(
+    "--llm-model",
+    default=lambda: _env("LLM_MODEL", "Qwen/Qwen2.5-32B-Instruct"),
+    help="LLM model name",
+)
+@click.option(
+    "--tts-voice",
+    default=lambda: _env("DEFAULT_VOICE", "af_heart"),
+    help="Default Kokoro TTS voice",
+)
+@click.option(
+    "--speaker-id/--no-speaker-id",
+    default=False,
+    help="Enable speaker identification",
+)
+@click.option(
+    "--speaker-id-url",
+    default=lambda: _env("SPEAKER_ID_URL", "http://localhost:8003/identify"),
+    help="Speaker ID /identify endpoint",
+)
+@click.option(
+    "--max-history",
+    default=20,
+    type=int,
+    help="Max conversation turns to keep per channel",
+)
+def discord_bot_cmd(
+    config: str | None,
+    log_level: str,
+    token: str | None,
+    guild_id: tuple[str, ...],
+    whisper_url: str,
+    kokoro_url: str,
+    llm_url: str,
+    llm_model: str,
+    tts_voice: str,
+    speaker_id: bool,
+    speaker_id_url: str,
+    max_history: int,
+) -> None:
+    """Start the Discord voice channel bot."""
+    _setup_logging(log_level)
+
+    cfg_file: dict = {}
+    if config:
+        cfg_file = _load_toml_config(Path(config)).get("discord", {})
+
+    # Resolve token (CLI > env > config file)
+    resolved_token = token or cfg_file.get("token")
+    if not resolved_token:
+        import click as _click
+        raise _click.ClickException(
+            "Discord bot token is required. "
+            "Pass --token or set OPENCLAW_VOICE_DISCORD_TOKEN."
+        )
+
+    # Resolve guild IDs
+    resolved_guild_ids: list[int] = []
+    if guild_id:
+        resolved_guild_ids = [int(g) for g in guild_id]
+    elif cfg_file.get("guild_id"):
+        raw = cfg_file["guild_id"]
+        resolved_guild_ids = [int(raw)] if isinstance(raw, (str, int)) else [int(g) for g in raw]
+
+    from openclaw_voice.discord_bot import PipelineConfig, create_bot
+
+    pipeline_config = PipelineConfig(
+        whisper_url=whisper_url or cfg_file.get("whisper_url", "http://localhost:8001/inference"),
+        kokoro_url=kokoro_url or cfg_file.get("kokoro_url", "http://localhost:8002/v1/audio/speech"),
+        llm_url=llm_url or cfg_file.get("llm_url", "http://localhost:8000/v1/chat/completions"),
+        llm_model=llm_model or cfg_file.get("llm_model", "Qwen/Qwen2.5-32B-Instruct"),
+        tts_voice=tts_voice or cfg_file.get("tts_voice", "af_heart"),
+        enable_speaker_id=speaker_id or cfg_file.get("enable_speaker_id", False),
+        speaker_id_url=speaker_id_url or cfg_file.get(
+            "speaker_id_url", "http://localhost:8003/identify"
+        ),
+        max_history_turns=max_history or cfg_file.get("max_history_turns", 20),
+    )
+
+    bot = create_bot(
+        pipeline_config=pipeline_config,
+        guild_ids=resolved_guild_ids if resolved_guild_ids else None,
+    )
+
+    log.info(
+        "Starting Discord voice bot",
+        extra={
+            "guild_ids": resolved_guild_ids,
+            "llm_model": pipeline_config.llm_model,
+            "tts_voice": pipeline_config.tts_voice,
+        },
+    )
+
+    bot.run(resolved_token)
+
+
 if __name__ == "__main__":
     main()

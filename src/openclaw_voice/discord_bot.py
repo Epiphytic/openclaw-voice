@@ -73,6 +73,7 @@ ESCALATION_KEEPALIVE_S = 20
 ESCALATION_MAX_WAIT_S = 120
 
 _VOICE_STATE_FILE = Path.home() / ".openclaw" / "workspace" / "openclaw-voice" / "voice_state.json"
+_PID_FILE = Path.home() / ".openclaw" / "workspace" / "openclaw-voice" / "chip.pid"
 
 
 # ---------------------------------------------------------------------------
@@ -340,8 +341,26 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
     # ------------------------------------------------------------------
 
     async def on_ready(self) -> None:
+        # Kill any previous instance and write our PID
+        self._claim_pid_file()
         log.info("VoiceBot ready", extra={"user": str(self.user)})
         await self._restore_voice_state()
+
+    @staticmethod
+    def _claim_pid_file() -> None:
+        """Write our PID and kill any stale previous instance."""
+        import os
+        import signal
+
+        if _PID_FILE.is_file():
+            try:
+                old_pid = int(_PID_FILE.read_text().strip())
+                if old_pid != os.getpid():
+                    os.kill(old_pid, signal.SIGTERM)
+                    log.info("Killed previous instance (PID %d)", old_pid)
+            except (ValueError, ProcessLookupError, PermissionError):
+                pass
+        _PID_FILE.write_text(str(os.getpid()))
 
     async def _restore_voice_state(self) -> None:
         """Auto-reconnect to the last voice channel on restart."""
@@ -777,7 +796,7 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
                     extra={"guild_id": guild_id, "user_id": user_id, "seq": seq},
                 )
 
-                display_name = self._resolve_display_name(guild_id, user_id)
+                display_name = await self._resolve_display_name_async(guild_id, user_id)
 
                 # Transcribe in executor (blocking Whisper HTTP call)
                 transcript = await loop.run_in_executor(
@@ -1287,15 +1306,47 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
     # Helpers
     # ------------------------------------------------------------------
 
+    # Cache for resolved display names (user_id → name)
+    _name_cache: dict[int, str] = {}
+
     def _resolve_display_name(self, guild_id: int, user_id: int | str) -> str:
-        """Resolve a Discord user ID to their display name."""
+        """Resolve a Discord user ID to their display name (sync, cache-only)."""
         uid = int(user_id)
+        if uid in self._name_cache:
+            return self._name_cache[uid]
         try:
             guild = self.get_guild(guild_id)
             if guild:
                 member = guild.get_member(uid)
                 if member:
+                    self._name_cache[uid] = member.display_name
                     return member.display_name
+        except Exception:
+            pass
+        return str(user_id)
+
+    async def _resolve_display_name_async(self, guild_id: int, user_id: int | str) -> str:
+        """Resolve a Discord user ID to their display name with API fallback."""
+        uid = int(user_id)
+        # Check cache first
+        if uid in self._name_cache:
+            return self._name_cache[uid]
+        # Try local cache
+        try:
+            guild = self.get_guild(guild_id)
+            if guild:
+                member = guild.get_member(uid)
+                if member:
+                    self._name_cache[uid] = member.display_name
+                    return member.display_name
+                # Cache miss — fetch from API
+                try:
+                    member = await guild.fetch_member(uid)
+                    if member:
+                        self._name_cache[uid] = member.display_name
+                        return member.display_name
+                except Exception:
+                    pass
         except Exception:
             pass
         return str(user_id)

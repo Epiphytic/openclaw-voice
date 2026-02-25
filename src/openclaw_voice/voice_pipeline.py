@@ -387,7 +387,8 @@ class VoicePipeline:
                         if m["role"] == "user":
                             user_msg = m["content"]
                             break
-                    return result, user_msg or "User asked a question that needs escalation"
+                    # Return empty text — the LLM worker uses its own interim text
+                    return "", user_msg or "User asked a question that needs escalation"
 
                 return result, escalation
 

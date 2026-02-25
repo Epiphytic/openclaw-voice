@@ -435,8 +435,8 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
         if not text_channel_id or message.channel.id != text_channel_id:
             return
 
-        # Skip all bot messages (any bot, not just Chip)
-        if message.author.bot:
+        # Skip Chip's own messages — but allow other bots (e.g. Bel)
+        if message.author.id == self.user.id:
             return
 
         content = message.content.strip()
@@ -836,7 +836,7 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
                             if text_channel:
                                 ctx_lines: list[str] = []
                                 async for msg in text_channel.history(limit=n_ctx):
-                                    if msg.author.bot:
+                                    if msg.author.id == self.user.id:
                                         continue
                                     if msg.content:
                                         ctx_lines.append(

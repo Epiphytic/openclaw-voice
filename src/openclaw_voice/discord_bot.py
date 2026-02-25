@@ -822,12 +822,17 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
         request_text: str,
         guild_id: int,
     ) -> None:
-        """Escalation worker: call main agent via gateway, feed result back to log.
+        """Escalation worker: send user question to main agent, TTS the response.
 
-        Runs to completion (or 120s timeout). Never cancelled by new speech.
-        Every 20s sends a keepalive audio message to the voice channel.
-        On response: appends escalation_result → sets pending_llm_trigger so
-        the LLM generates a natural spoken response.
+        Simple passthrough — no LLM rephrase, no channel posting by the voice
+        bot. The main agent posts to the channel itself as part of its response.
+        Voice agent just renders the response as TTS audio.
+
+        Flow:
+          1. Voice agent already said "One moment" (queued by LLM worker)
+          2. Send user question to main agent via gateway
+          3. Main agent responds (and posts to channel on its own)
+          4. Voice agent TTS-renders the response -> playback
         """
         pipeline = self._pipelines.get(guild_id)
         if pipeline is None:
@@ -844,100 +849,39 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
         )
 
         try:
-            # Post escalation notice to channel
-            await self._post_to_channel(
-                guild_id,
-                f"🫖 **{bot_name} → {agent_name}**: {request_text}",
+            # Send to main agent via gateway
+            bel_response = await asyncio.wait_for(
+                self._send_to_bel(request_text, "voice user", guild_id),
+                timeout=ESCALATION_MAX_WAIT_S,
             )
-
-            # Start gateway task
-            gateway_task = asyncio.create_task(
-                self._send_to_bel(request_text, "voice user", guild_id)
-            )
-
-            keepalive_messages = [
-                f"{agent_name}'s thinking about that, one moment.",
-                f"Still waiting on {agent_name}, hang tight.",
-                f"{agent_name}'s taking a bit — still working on it.",
-            ]
-            keepalive_count = 0
-            elapsed_s = 0
-            bel_response: str | None = None
-
-            while elapsed_s < ESCALATION_MAX_WAIT_S:
-                try:
-                    bel_response = await asyncio.wait_for(
-                        asyncio.shield(gateway_task),
-                        timeout=ESCALATION_KEEPALIVE_S,
-                    )
-                    break  # Got a response
-                except asyncio.TimeoutError:
-                    elapsed_s += ESCALATION_KEEPALIVE_S
-                    keepalive_count += 1
-                    keepalive_text = keepalive_messages[
-                        min(keepalive_count - 1, len(keepalive_messages) - 1)
-                    ]
-                    log.info(
-                        "Escalation keepalive #%d for guild %s", keepalive_count, guild_id
-                    )
-
-                    # Append keepalive to log (context for LLM)
-                    session.log.append(
-                        LogEntry(
-                            ts=time.monotonic(),
-                            kind="system",
-                            speaker="system",
-                            text=f"Still waiting for {agent_name}...",
-                        )
-                    )
-
-                    # Synthesise and queue keepalive audio
-                    audio = await loop.run_in_executor(
-                        None, pipeline.synthesize_response, keepalive_text
-                    )
-                    if audio:
-                        with contextlib.suppress(asyncio.QueueFull):
-                            session.playback_queue.put_nowait(audio)
-
-            # If still running past timeout, cancel and grab any partial result
-            if not gateway_task.done():
-                gateway_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await gateway_task
-            elif not gateway_task.cancelled():
-                try:
-                    bel_response = bel_response or gateway_task.result()
-                except Exception as exc:
-                    log.warning("Gateway task raised exception: %s", exc)
-
-            # Truncate very long responses
-            if bel_response and len(bel_response) > 1500:
-                bel_response = bel_response[:1500] + "..."
 
             if not bel_response:
-                await self._post_to_channel(
-                    guild_id,
-                    f"🔔 **{agent_name} → {bot_name}**: ⚠️ *(no response — may be busy)*",
+                fail_text = f"Sorry, I couldn't reach {agent_name}."
+                audio = await loop.run_in_executor(
+                    None, pipeline.synthesize_response, fail_text
                 )
-                # Append fallback result so LLM can acknowledge the failure
+                if audio:
+                    with contextlib.suppress(asyncio.QueueFull):
+                        session.playback_queue.put_nowait(audio)
                 session.log.append(
                     LogEntry(
                         ts=time.monotonic(),
                         kind="escalation_result",
                         speaker=agent_name,
-                        text=f"No response from {agent_name} — may be unavailable right now.",
+                        text=f"No response from {agent_name}.",
                     )
                 )
-                session.pending_llm_trigger.set()
                 return
 
-            # Post response to Discord
-            display_text = bel_response[:1800] if len(bel_response) > 1800 else bel_response
-            await self._post_to_channel(
-                guild_id, f"🔔 **{agent_name} → {bot_name}**: {display_text}"
+            # Truncate for TTS
+            tts_text = bel_response[:1500] if len(bel_response) > 1500 else bel_response
+
+            log.info(
+                "Escalation response received, rendering TTS",
+                extra={"guild_id": guild_id, "response_len": len(bel_response)},
             )
 
-            # Append escalation_result to log → trigger LLM to generate spoken response
+            # Record in conversation log for context
             session.log.append(
                 LogEntry(
                     ts=time.monotonic(),
@@ -946,18 +890,30 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
                     text=bel_response,
                 )
             )
-            session.pending_llm_trigger.set()
 
+            # TTS render directly — no rephrase, no channel post
+            audio = await loop.run_in_executor(
+                None, pipeline.synthesize_response, tts_text
+            )
+            if audio:
+                with contextlib.suppress(asyncio.QueueFull):
+                    session.playback_queue.put_nowait(audio)
+
+        except asyncio.TimeoutError:
+            log.warning("Escalation timed out for guild %s", guild_id)
+            fail_text = f"{agent_name} is taking too long, try again later."
+            audio = await loop.run_in_executor(
+                None, pipeline.synthesize_response, fail_text
+            )
+            if audio:
+                with contextlib.suppress(asyncio.QueueFull):
+                    session.playback_queue.put_nowait(audio)
         except asyncio.CancelledError:
             log.debug("Escalation worker cancelled for guild %s", guild_id)
         except Exception as exc:
             log.error(
                 "Escalation worker error for guild %s: %s", guild_id, exc, exc_info=True
             )
-
-    # ------------------------------------------------------------------
-    # Gateway (escalation send)
-    # ------------------------------------------------------------------
 
     async def _send_to_bel(self, request: str, user_name: str, guild_id: int = 0) -> str | None:
         """Send a request to Bel via the OpenClaw gateway WebSocket.
@@ -986,9 +942,12 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
         message = (
             f"{' | '.join(context_parts)}\n"
             f"{user_name} asked via voice: {request}\n\n"
-            f"IMPORTANT: Reply with a SHORT answer (1-3 sentences max) suitable for "
-            f"text-to-speech. No markdown, no links, no code. {bot_name} will speak "
-            f"your response aloud."
+            f"INSTRUCTIONS:\n"
+            f"1. Post your response to the Discord channel (ID: {text_channel_id or 'unknown'}) "
+            f"so the user can see it in text.\n"
+            f"2. Your response text will ALSO be spoken aloud via TTS — keep it SHORT "
+            f"(1-3 sentences), no markdown, no links, no code blocks.\n"
+            f"3. Do NOT say NO_REPLY — always respond with text for the voice user."
         )
         return await send_to_bel(message, timeout_s=90.0)
 
@@ -1083,14 +1042,6 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
             log.debug("Posted to channel %s: %s", channel_id, message[:80])
         except Exception as exc:
             log.warning("Failed to post to channel %s: %s", channel_id, exc, exc_info=True)
-
-    def _rephrase_for_speech(self, pipeline: VoicePipeline, bel_response: str) -> str:
-        """Use the LLM to rephrase the main agent's response for natural speech.
-
-        Delegates to the pipeline's own rephrase_for_speech() method which
-        handles the LLM call and think-tag stripping.
-        """
-        return pipeline.rephrase_for_speech(bel_response)
 
 
 # ---------------------------------------------------------------------------

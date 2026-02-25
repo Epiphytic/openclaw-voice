@@ -50,6 +50,7 @@ dev = [
     "ruff>=0.1",
     "mypy>=1.5",
     "respx>=0.20",
+    "setuptools",
 ]
 all = [
     "openclaw-voice[speaker-id,discord,dev]",

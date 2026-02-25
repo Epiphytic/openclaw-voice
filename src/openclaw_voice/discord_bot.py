@@ -435,9 +435,18 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
         if not text_channel_id or message.channel.id != text_channel_id:
             return
 
-        # Skip Chip's own messages — but allow other bots (e.g. Bel)
+        # Skip Chip's own messages
         if message.author.id == self.user.id:
             return
+
+        # Skip messages from users currently in the voice channel — they can hear themselves
+        session = self._sessions.get(guild_id)
+        if session and not message.author.bot:
+            vc = message.guild.voice_client if message.guild else None
+            if vc and vc.channel:
+                voice_member_ids = {m.id for m in vc.channel.members}
+                if message.author.id in voice_member_ids:
+                    return
 
         content = message.content.strip()
         if not content:

@@ -38,9 +38,11 @@ class VoiceActivityDetector:
     Args:
         aggressiveness:       webrtcvad aggressiveness level 0–3 (default 3).
         silence_threshold_ms: Milliseconds of continuous silence after speech
-                              that triggers an utterance flush (default 800 ms).
+                              that triggers an utterance flush (default 1500 ms).
+                              Increased from 800 ms to prevent mid-sentence splits.
         min_speech_ms:        Minimum speech duration to emit an utterance
-                              (default 100 ms). Prevents tiny glitches.
+                              (default 500 ms). Filters breath sounds and false
+                              triggers. Raised from 100 ms for production use.
 
     Each call to :meth:`process` accepts exactly one 20 ms PCM frame.
     When a complete utterance is detected it returns the raw PCM bytes
@@ -50,8 +52,8 @@ class VoiceActivityDetector:
     def __init__(
         self,
         aggressiveness: int = 3,
-        silence_threshold_ms: int = 800,
-        min_speech_ms: int = 100,
+        silence_threshold_ms: int = 1500,
+        min_speech_ms: int = 500,
     ) -> None:
         if aggressiveness not in range(4):
             raise ValueError(f"aggressiveness must be 0–3, got {aggressiveness}")

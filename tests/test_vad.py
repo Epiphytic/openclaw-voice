@@ -43,7 +43,7 @@ class TestVoiceActivityDetectorInit:
     def test_defaults(self):
         vad = VoiceActivityDetector()
         assert vad.aggressiveness == 3
-        assert vad.silence_threshold_ms == 800
+        assert vad.silence_threshold_ms == 1500
         assert not vad.is_speaking
 
     def test_custom_aggressiveness(self):

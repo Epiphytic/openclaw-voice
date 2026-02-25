@@ -32,6 +32,7 @@ import queue
 import subprocess
 import tempfile
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -62,6 +63,14 @@ DISCORD_SAMPLE_WIDTH = 2       # int16
 # Max size of the response playback queue
 PLAYBACK_QUEUE_MAXSIZE = 10
 
+# If a pipeline response is older than this (seconds since utterance was enqueued)
+# by the time it would play, discard it — the user has moved on.
+MAX_RESPONSE_AGE_S: float = 5.0
+
+# Default VAD settings — tuned for natural speech with brief pauses
+DEFAULT_VAD_SILENCE_MS = 1500
+DEFAULT_VAD_MIN_SPEECH_MS = 500
+
 
 # ---------------------------------------------------------------------------
 # VAD Sink (pycord voice receive)
@@ -74,33 +83,47 @@ class VoiceSink(Sink):  # type: ignore[misc]
     the shared ``utterance_queue`` for async processing.
 
     Args:
-        utterance_queue: asyncio.Queue for (user_id, pcm_bytes) tuples.
+        utterance_queue: asyncio.Queue for (user_id, pcm_bytes, enqueued_at, seq) tuples.
         loop:            The running asyncio event loop.
+        vad_silence_ms:  Silence threshold in ms before flushing an utterance.
+        vad_min_speech_ms: Minimum speech ms to be considered a real utterance.
     """
 
     def __init__(
         self,
         utterance_queue: asyncio.Queue,  # type: ignore[type-arg]
         loop: asyncio.AbstractEventLoop,
+        vad_silence_ms: int = DEFAULT_VAD_SILENCE_MS,
+        vad_min_speech_ms: int = DEFAULT_VAD_MIN_SPEECH_MS,
         *args,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
         self._utterance_queue = utterance_queue
         self._loop = loop
+        self._vad_silence_ms = vad_silence_ms
+        self._vad_min_speech_ms = vad_min_speech_ms
         # Per-user VAD instances keyed by Discord user ID
         self._vad_instances: dict[int, VoiceActivityDetector] = {}
         # Per-user raw frame buffers (to handle partial frames)
         self._buffers: dict[int, bytes] = {}
+        # Per-user monotonic sequence counter — incremented each utterance
+        self._user_seqs: dict[int, int] = {}
 
     def _get_vad(self, user_id: int) -> VoiceActivityDetector:
         """Get or create a VAD instance for a user."""
         if user_id not in self._vad_instances:
             self._vad_instances[user_id] = VoiceActivityDetector(
                 aggressiveness=3,
-                silence_threshold_ms=800,
+                silence_threshold_ms=self._vad_silence_ms,
+                min_speech_ms=self._vad_min_speech_ms,
             )
-            log.debug("Created VAD for user %s", user_id)
+            log.debug(
+                "Created VAD for user %s (silence_ms=%d, min_speech_ms=%d)",
+                user_id,
+                self._vad_silence_ms,
+                self._vad_min_speech_ms,
+            )
         return self._vad_instances[user_id]
 
     def write(self, data: bytes, user: int) -> None:  # type: ignore[override]
@@ -108,6 +131,10 @@ class VoiceSink(Sink):  # type: ignore[misc]
 
         pycord provides raw 48kHz stereo int16 PCM. We need to downsample
         to 16kHz mono before feeding to webrtcvad.
+
+        Each emitted utterance tuple is ``(user_id, pcm_bytes, enqueued_at, seq)``
+        where ``enqueued_at`` is ``time.monotonic()`` at detection time and
+        ``seq`` is a per-user monotonically increasing integer used for debounce.
         """
         # Accumulate data in per-user buffer
         buf = self._buffers.get(user, b"") + data
@@ -132,10 +159,16 @@ class VoiceSink(Sink):  # type: ignore[misc]
             try:
                 utterance = vad.process(frame)
                 if utterance is not None:
+                    seq = self._user_seqs.get(user, 0) + 1
+                    self._user_seqs[user] = seq
+                    enqueued_at = time.monotonic()
                     # Schedule utterance delivery on the event loop
                     self._loop.call_soon_threadsafe(
                         self._utterance_queue.put_nowait,
-                        (user, utterance),
+                        (user, utterance, enqueued_at, seq),
+                    )
+                    log.debug(
+                        "Utterance enqueued for user %s (seq=%d)", user, seq
                     )
             except Exception as exc:
                 log.warning("VAD error for user %s: %s", user, exc)
@@ -144,6 +177,7 @@ class VoiceSink(Sink):  # type: ignore[misc]
         """Clean up all VAD state when recording stops."""
         self._vad_instances.clear()
         self._buffers.clear()
+        self._user_seqs.clear()
         log.debug("VoiceSink cleaned up")
 
 
@@ -155,14 +189,21 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
     """Discord bot that listens in voice channels and responds via TTS.
 
     Args:
-        pipeline_config: VoicePipeline configuration.
-        guild_ids:       List of guild IDs to register slash commands for.
+        pipeline_config:      VoicePipeline configuration.
+        guild_ids:            List of guild IDs to register slash commands for.
+        transcript_channel_id: Discord channel ID to post conversation transcripts.
+                              Set to None to disable transcript posting.
+        vad_silence_ms:       VAD silence threshold in ms (default 1500).
+        vad_min_speech_ms:    VAD minimum speech duration in ms (default 500).
     """
 
     def __init__(
         self,
         pipeline_config: PipelineConfig | None = None,
         guild_ids: list[int] | None = None,
+        transcript_channel_id: int | None = None,
+        vad_silence_ms: int = DEFAULT_VAD_SILENCE_MS,
+        vad_min_speech_ms: int = DEFAULT_VAD_MIN_SPEECH_MS,
         **kwargs,
     ) -> None:
         if not _PYCORD_AVAILABLE:
@@ -175,6 +216,9 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
 
         self._pipeline_config = pipeline_config or PipelineConfig()
         self._guild_ids = guild_ids or []
+        self._transcript_channel_id = transcript_channel_id
+        self._vad_silence_ms = vad_silence_ms
+        self._vad_min_speech_ms = vad_min_speech_ms
 
         # Per-guild voice pipelines (one per active voice channel)
         self._pipelines: dict[int, VoicePipeline] = {}
@@ -300,9 +344,14 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
         self._utterance_queues[guild_id] = utterance_q
         self._playback_queues[guild_id] = playback_q
 
-        # Start the voice sink
+        # Start the voice sink with configurable VAD parameters
         loop = asyncio.get_event_loop()
-        sink = VoiceSink(utterance_q, loop)
+        sink = VoiceSink(
+            utterance_q,
+            loop,
+            vad_silence_ms=self._vad_silence_ms,
+            vad_min_speech_ms=self._vad_min_speech_ms,
+        )
         vc.start_recording(sink, self._on_recording_finished, guild_id)
 
         # Start processing and playback tasks
@@ -344,54 +393,195 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
         guild_id: int,
         vc: discord.VoiceClient,
     ) -> None:
-        """Process utterances from the queue and schedule playback."""
+        """Dispatch per-user pipeline tasks from the utterance queue.
+
+        Each user gets their own asyncio Task so that a new utterance from
+        the same user immediately cancels any in-flight response — preventing
+        stale responses from piling up when speech is fragmented.
+
+        Utterance tuples from VoiceSink: ``(user_id, pcm_bytes, enqueued_at, seq)``
+        """
+        if guild_id not in self._utterance_queues:
+            log.error("Utterance queue missing for guild %s", guild_id)
+            return
+
+        log.debug("Utterance dispatcher started for guild %s", guild_id)
+        utterance_q = self._utterance_queues[guild_id]
+
+        # Per-user in-flight pipeline tasks
+        user_tasks: dict[int, asyncio.Task] = {}  # type: ignore[type-arg]
+
+        try:
+            while True:
+                user_id, pcm_bytes, enqueued_at, seq = await utterance_q.get()
+                log.debug(
+                    "Utterance received",
+                    extra={"guild_id": guild_id, "user_id": user_id, "seq": seq},
+                )
+
+                # Cancel any existing in-flight task for this user — their new
+                # utterance supersedes the old one.
+                old_task = user_tasks.get(user_id)
+                if old_task and not old_task.done():
+                    log.info(
+                        "New utterance from user %s (seq=%d); cancelling in-flight response",
+                        user_id,
+                        seq,
+                    )
+                    old_task.cancel()
+                    # Yield one cycle so the cancellation can propagate before
+                    # we start the replacement task.
+                    await asyncio.sleep(0)
+
+                # Start a new per-user task for this utterance
+                task: asyncio.Task = asyncio.create_task(  # type: ignore[type-arg]
+                    self._run_single_utterance(
+                        guild_id, vc, user_id, pcm_bytes, enqueued_at, seq
+                    ),
+                    name=f"pipeline-{guild_id}-{user_id}-{seq}",
+                )
+                user_tasks[user_id] = task
+
+                # Clean up completed tasks to avoid memory growth
+                user_tasks = {uid: t for uid, t in user_tasks.items() if not t.done()}
+
+                utterance_q.task_done()
+
+        except asyncio.CancelledError:
+            log.debug("Utterance dispatcher cancelled for guild %s", guild_id)
+            # Cancel all in-flight user tasks on shutdown
+            for task in user_tasks.values():
+                if not task.done():
+                    task.cancel()
+
+    async def _run_single_utterance(
+        self,
+        guild_id: int,
+        vc: discord.VoiceClient,
+        user_id: int,
+        pcm_bytes: bytes,
+        enqueued_at: float,
+        seq: int,
+    ) -> None:
+        """Run the STT → LLM → TTS pipeline for a single user utterance.
+
+        Checks response age before queuing playback. If cancelled (due to a
+        newer utterance arriving), exits cleanly without queuing audio.
+        Also posts a transcript summary to the configured transcript channel.
+        """
         pipeline = self._pipelines.get(guild_id)
         playback_q = self._playback_queues.get(guild_id)
 
         if pipeline is None or playback_q is None:
-            log.error("Pipeline or playback queue missing for guild %s", guild_id)
+            log.error("Pipeline or playback queue gone for guild %s", guild_id)
             return
 
-        log.debug("Utterance processor started for guild %s", guild_id)
-        utterance_q = self._utterance_queues[guild_id]
+        try:
+            loop = asyncio.get_event_loop()
+            transcript, response_text, response_audio = await loop.run_in_executor(
+                None,
+                pipeline.process_utterance,
+                pcm_bytes,
+                str(user_id),
+            )
 
-        while True:
-            try:
-                user_id, pcm_bytes = await utterance_q.get()
-                log.debug(
-                    "Processing utterance",
-                    extra={"guild_id": guild_id, "user_id": user_id},
-                )
+        except asyncio.CancelledError:
+            log.info(
+                "Pipeline task cancelled (user %s seq=%d) — newer utterance superseded it",
+                user_id,
+                seq,
+            )
+            raise  # propagate so asyncio marks the task as cancelled
 
-                # Run synchronous pipeline in thread pool to avoid blocking event loop
-                loop = asyncio.get_event_loop()
-                response_text, response_audio = await loop.run_in_executor(
-                    None,
-                    pipeline.process_utterance,
-                    pcm_bytes,
-                    str(user_id),
-                )
+        except Exception as exc:
+            log.error(
+                "Error in pipeline for guild %s user %s: %s",
+                guild_id,
+                user_id,
+                exc,
+            )
+            return
 
-                if response_audio:
-                    try:
-                        playback_q.put_nowait(response_audio)
-                    except asyncio.QueueFull:
-                        log.warning(
-                            "Playback queue full for guild %s, dropping response",
-                            guild_id,
-                        )
+        if not response_audio:
+            return
 
-                utterance_q.task_done()
+        # ── Response age guard ───────────────────────────────────────────────
+        # Discard the response if too much time has passed since the utterance
+        # was detected (user has likely moved on).
+        response_age_s = time.monotonic() - enqueued_at
+        if response_age_s > MAX_RESPONSE_AGE_S:
+            log.info(
+                "Response discarded — too old (%.1fs > %.1fs) for user %s seq=%d",
+                response_age_s,
+                MAX_RESPONSE_AGE_S,
+                user_id,
+                seq,
+            )
+            return
 
-            except asyncio.CancelledError:
-                log.debug("Utterance processor cancelled for guild %s", guild_id)
-                break
-            except Exception as exc:
-                log.error(
-                    "Error processing utterance for guild %s: %s",
-                    guild_id,
-                    exc,
-                )
+        # ── Transcript channel posting ────────────────────────────────────────
+        if transcript and response_text and self._transcript_channel_id:
+            await self._post_transcript(guild_id, user_id, transcript, response_text)
+
+        # ── Queue audio for playback ─────────────────────────────────────────
+        try:
+            playback_q.put_nowait(response_audio)
+        except asyncio.QueueFull:
+            log.warning(
+                "Playback queue full for guild %s, dropping response (user %s)",
+                guild_id,
+                user_id,
+            )
+
+    async def _post_transcript(
+        self,
+        guild_id: int,
+        user_id: int,
+        transcript: str,
+        response_text: str,
+    ) -> None:
+        """Post a conversation transcript to the configured transcript channel.
+
+        Format::
+
+            **Liam** (03:59): "Hey, can you hear me?"
+            **Assistant** (03:59): "Yes, I can hear you clearly."
+        """
+        if not self._transcript_channel_id:
+            return
+
+        # Resolve display name: try guild members first, fall back to global user cache
+        display_name = str(user_id)  # fallback
+        try:
+            guild = self.get_guild(guild_id)
+            if guild:
+                member = guild.get_member(user_id)
+                if member:
+                    display_name = member.display_name
+        except Exception as exc:
+            log.debug("Could not resolve display name for user %s: %s", user_id, exc)
+
+        import datetime
+        ts = datetime.datetime.now().strftime("%H:%M")
+        message = (
+            f'**{display_name}** ({ts}): "{transcript}"\n'
+            f'**Assistant** ({ts}): "{response_text}"'
+        )
+
+        try:
+            await self.http.send_message(
+                self._transcript_channel_id,
+                content=message,
+            )
+            log.debug(
+                "Transcript posted to channel %s", self._transcript_channel_id
+            )
+        except Exception as exc:
+            log.warning(
+                "Failed to post transcript to channel %s: %s",
+                self._transcript_channel_id,
+                exc,
+            )
 
     async def _playback_worker(
         self,
@@ -498,12 +688,18 @@ def _resample_48k_stereo_to_16k_mono(pcm: bytes) -> bytes:
 def create_bot(
     pipeline_config: PipelineConfig | None = None,
     guild_ids: list[int] | None = None,
+    transcript_channel_id: int | None = None,
+    vad_silence_ms: int = DEFAULT_VAD_SILENCE_MS,
+    vad_min_speech_ms: int = DEFAULT_VAD_MIN_SPEECH_MS,
 ) -> "VoiceBot":
     """Create a configured VoiceBot instance.
 
     Args:
-        pipeline_config: VoicePipeline configuration.
-        guild_ids:       Guild IDs for slash command registration.
+        pipeline_config:      VoicePipeline configuration.
+        guild_ids:            Guild IDs for slash command registration.
+        transcript_channel_id: Discord channel ID for transcript posting. None to disable.
+        vad_silence_ms:       VAD silence threshold in ms (default 1500).
+        vad_min_speech_ms:    VAD minimum speech duration in ms (default 500).
 
     Returns:
         Configured VoiceBot ready to run.
@@ -519,5 +715,8 @@ def create_bot(
     return VoiceBot(
         pipeline_config=pipeline_config,
         guild_ids=guild_ids,
+        transcript_channel_id=transcript_channel_id,
+        vad_silence_ms=vad_silence_ms,
+        vad_min_speech_ms=vad_min_speech_ms,
         intents=intents,
     )

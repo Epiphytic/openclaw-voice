@@ -447,6 +447,24 @@ def all_cmd(
     type=int,
     help="Max conversation turns to keep per channel",
 )
+@click.option(
+    "--vad-silence-ms",
+    default=lambda: int(_env("VAD_SILENCE_MS", "1500")),
+    type=int,
+    help="VAD silence threshold in ms before flushing an utterance (default 1500)",
+)
+@click.option(
+    "--vad-min-speech-ms",
+    default=lambda: int(_env("VAD_MIN_SPEECH_MS", "500")),
+    type=int,
+    help="VAD minimum speech duration in ms to emit an utterance (default 500)",
+)
+@click.option(
+    "--transcript-channel-id",
+    default=lambda: _env("TRANSCRIPT_CHANNEL_ID"),
+    type=str,
+    help="Discord channel ID for posting conversation transcripts (optional)",
+)
 def discord_bot_cmd(
     config: str | None,
     log_level: str,
@@ -460,6 +478,9 @@ def discord_bot_cmd(
     speaker_id: bool,
     speaker_id_url: str,
     max_history: int,
+    vad_silence_ms: int,
+    vad_min_speech_ms: int,
+    transcript_channel_id: str | None,
 ) -> None:
     """Start the Discord voice channel bot."""
     _setup_logging(log_level)
@@ -485,7 +506,12 @@ def discord_bot_cmd(
         raw = cfg_file["guild_id"]
         resolved_guild_ids = [int(raw)] if isinstance(raw, (str, int)) else [int(g) for g in raw]
 
-    from openclaw_voice.discord_bot import PipelineConfig, create_bot
+    from openclaw_voice.discord_bot import (
+        DEFAULT_VAD_SILENCE_MS,
+        DEFAULT_VAD_MIN_SPEECH_MS,
+        PipelineConfig,
+        create_bot,
+    )
 
     pipeline_config = PipelineConfig(
         whisper_url=whisper_url or cfg_file.get("whisper_url", "http://localhost:8001/inference"),
@@ -500,9 +526,26 @@ def discord_bot_cmd(
         max_history_turns=max_history or cfg_file.get("max_history_turns", 20),
     )
 
+    # Resolve VAD and transcript settings (CLI > env > config file > defaults)
+    resolved_vad_silence_ms: int = (
+        vad_silence_ms
+        or int(cfg_file.get("vad_silence_ms", DEFAULT_VAD_SILENCE_MS))
+    )
+    resolved_vad_min_speech_ms: int = (
+        vad_min_speech_ms
+        or int(cfg_file.get("vad_min_speech_ms", DEFAULT_VAD_MIN_SPEECH_MS))
+    )
+    raw_channel_id = transcript_channel_id or cfg_file.get("transcript_channel_id")
+    resolved_transcript_channel_id: int | None = (
+        int(raw_channel_id) if raw_channel_id else None
+    )
+
     bot = create_bot(
         pipeline_config=pipeline_config,
         guild_ids=resolved_guild_ids if resolved_guild_ids else None,
+        transcript_channel_id=resolved_transcript_channel_id,
+        vad_silence_ms=resolved_vad_silence_ms,
+        vad_min_speech_ms=resolved_vad_min_speech_ms,
     )
 
     log.info(
@@ -511,6 +554,9 @@ def discord_bot_cmd(
             "guild_ids": resolved_guild_ids,
             "llm_model": pipeline_config.llm_model,
             "tts_voice": pipeline_config.tts_voice,
+            "vad_silence_ms": resolved_vad_silence_ms,
+            "vad_min_speech_ms": resolved_vad_min_speech_ms,
+            "transcript_channel_id": resolved_transcript_channel_id,
         },
     )
 

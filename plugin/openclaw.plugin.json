@@ -1,0 +1,180 @@
+{
+  "id": "discord-voice",
+  "name": "Discord Voice",
+  "description": "Real-time Discord voice assistant with local LLM, STT, and TTS",
+  "version": "0.1.0",
+  "uiHints": {
+    "botToken": {
+      "label": "Discord Bot Token",
+      "sensitive": true
+    },
+    "guildIds": {
+      "label": "Guild IDs",
+      "help": "Discord server IDs to operate in (array of numbers)"
+    },
+    "transcriptChannelId": {
+      "label": "Transcript Channel ID",
+      "help": "Discord channel ID for posting voice transcripts (optional)"
+    },
+    "llmModel": {
+      "label": "LLM Model",
+      "placeholder": "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    },
+    "llmUrl": {
+      "label": "LLM URL",
+      "placeholder": "http://localhost:8000/v1/chat/completions"
+    },
+    "whisperUrl": {
+      "label": "Whisper URL",
+      "placeholder": "http://localhost:8001/inference"
+    },
+    "kokoroUrl": {
+      "label": "Kokoro TTS URL",
+      "placeholder": "http://localhost:8002/v1/audio/speech"
+    },
+    "ttsVoice": {
+      "label": "TTS Voice",
+      "placeholder": "af_heart"
+    },
+    "botName": {
+      "label": "Bot Name",
+      "placeholder": "Assistant"
+    },
+    "mainAgentName": {
+      "label": "Main Agent Name",
+      "placeholder": "main agent"
+    },
+    "defaultLocation": {
+      "label": "Default Location",
+      "placeholder": "Vancouver, BC, Canada"
+    },
+    "defaultTimezone": {
+      "label": "Default Timezone",
+      "placeholder": "UTC"
+    },
+    "extraContext": {
+      "label": "Extra Context",
+      "help": "Freeform context appended to the voice bot's system prompt"
+    },
+    "whisperPrompt": {
+      "label": "Whisper Prompt",
+      "help": "Vocabulary hints for Whisper transcription (unusual names, terms)"
+    },
+    "vadMinSpeechMs": {
+      "label": "VAD Min Speech (ms)",
+      "advanced": true
+    },
+    "speechEndDelayMs": {
+      "label": "Speech End Delay (ms)",
+      "advanced": true
+    },
+    "channelContextMessages": {
+      "label": "Channel Context Messages",
+      "advanced": true
+    },
+    "ttsReadChannel": {
+      "label": "TTS Read Channel",
+      "help": "Read aloud messages posted to the linked text channel",
+      "advanced": true
+    },
+    "correctionsFile": {
+      "label": "Corrections File",
+      "help": "Path to TOML file with post-STT word corrections",
+      "advanced": true
+    },
+    "controlPort": {
+      "label": "Control Port",
+      "help": "HTTP port for the Python bot's control/health server (default 18790)",
+      "advanced": true
+    },
+    "pythonPath": {
+      "label": "Python Path",
+      "help": "Override Python executable path. Leave empty for auto-detection.",
+      "advanced": true
+    }
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "enabled": {
+        "type": "boolean"
+      },
+      "pythonPath": {
+        "type": "string",
+        "description": "Override Python executable. Auto-detected if empty."
+      },
+      "botToken": {
+        "type": "string",
+        "description": "Discord bot token"
+      },
+      "guildIds": {
+        "type": "array",
+        "items": { "type": "number" },
+        "description": "Discord guild IDs"
+      },
+      "transcriptChannelId": {
+        "type": "string",
+        "description": "Discord channel ID for posting transcripts"
+      },
+      "llmModel": {
+        "type": "string"
+      },
+      "llmUrl": {
+        "type": "string"
+      },
+      "whisperUrl": {
+        "type": "string"
+      },
+      "kokoroUrl": {
+        "type": "string"
+      },
+      "ttsVoice": {
+        "type": "string"
+      },
+      "botName": {
+        "type": "string"
+      },
+      "mainAgentName": {
+        "type": "string"
+      },
+      "defaultLocation": {
+        "type": "string"
+      },
+      "defaultTimezone": {
+        "type": "string"
+      },
+      "extraContext": {
+        "type": "string"
+      },
+      "whisperPrompt": {
+        "type": "string"
+      },
+      "vadMinSpeechMs": {
+        "type": "number",
+        "minimum": 0
+      },
+      "speechEndDelayMs": {
+        "type": "number",
+        "minimum": 0
+      },
+      "channelContextMessages": {
+        "type": "number",
+        "minimum": 0
+      },
+      "ttsReadChannel": {
+        "type": "boolean"
+      },
+      "correctionsFile": {
+        "type": "string"
+      },
+      "controlPort": {
+        "type": "number",
+        "minimum": 1,
+        "maximum": 65535,
+        "description": "HTTP port for the Python bot control/health server (default 18790)"
+      }
+    },
+    "required": ["botToken", "guildIds"]
+  }
+}

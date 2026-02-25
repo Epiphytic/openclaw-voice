@@ -1,0 +1,17 @@
+{
+  "name": "@epiphytic/openclaw-discord-voice",
+  "version": "0.1.0",
+  "description": "OpenClaw plugin for Discord voice bot (Chip)",
+  "type": "module",
+  "dependencies": {
+    "@sinclair/typebox": "0.34.48"
+  },
+  "devDependencies": {
+    "openclaw": "workspace:*"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}

@@ -302,6 +302,8 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
         vad_silence_ms: int = DEFAULT_VAD_SILENCE_MS,
         vad_min_speech_ms: int = DEFAULT_VAD_MIN_SPEECH_MS,
         speech_end_delay_ms: int = 1000,
+        control_port: int = 18790,
+        gateway_port: int | None = None,
         **kwargs,
     ) -> None:
         if not _PYCORD_AVAILABLE:
@@ -321,6 +323,12 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
         self._vad_silence_ms = vad_silence_ms
         self._vad_min_speech_ms = vad_min_speech_ms
         self._speech_end_delay_ms = speech_end_delay_ms
+
+        # HTTP control server settings (plugin mode)
+        self._control_port = control_port
+        self._gateway_port = gateway_port  # OpenClaw gateway port for escalation
+        self._control_server_task: asyncio.Task | None = None  # type: ignore[type-arg]
+        self._start_time = time.monotonic()
 
         # Per-guild voice pipelines (one per active voice channel)
         self._pipelines: dict[int, VoicePipeline] = {}
@@ -347,6 +355,8 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
         await self._build_cast()
         log.info("VoiceBot ready", extra={"user": str(self.user)})
         await self._restore_voice_state()
+        # Start the HTTP control/health server (for plugin agent tools + health checks)
+        self._control_server_task = asyncio.create_task(self._run_control_server())
 
     # ------------------------------------------------------------------
     # Cast of characters — built on startup for fast message handling
@@ -452,6 +462,143 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
             )
         except Exception as exc:
             log.warning("Failed to restore voice state: %s", exc)
+
+    # ------------------------------------------------------------------
+    # HTTP control + health server (plugin mode)
+    # ------------------------------------------------------------------
+
+    async def _run_control_server(self) -> None:
+        """Lightweight aiohttp HTTP server for plugin ↔ bot communication.
+
+        Endpoints:
+            GET  /health           — status, active guilds, uptime
+            POST /control/join     — join a voice channel
+            POST /control/leave    — leave a voice channel
+            POST /control/speak    — synthesize and play text
+        """
+        try:
+            import aiohttp
+            from aiohttp import web
+        except ImportError:
+            log.warning(
+                "aiohttp not available — HTTP control server disabled. "
+                "Install with: pip install aiohttp"
+            )
+            return
+
+        routes = web.RouteTableDef()
+
+        @routes.get("/health")
+        async def health(_request: web.Request) -> web.Response:
+            active_guilds = list(self._sessions.keys())
+            return web.json_response({
+                "status": "ok",
+                "guilds": active_guilds,
+                "uptime": time.monotonic() - self._start_time,
+                "gateway_port": self._gateway_port,
+            })
+
+        @routes.post("/control/join")
+        async def control_join(request: web.Request) -> web.Response:
+            try:
+                data = await request.json()
+                guild_id = int(data.get("guild_id", 0))
+                channel_id = int(data.get("channel_id", 0))
+            except Exception as exc:
+                return web.json_response({"error": str(exc)}, status=400)
+
+            guild = self.get_guild(guild_id)
+            if guild is None:
+                return web.json_response({"error": f"Guild {guild_id} not found"}, status=404)
+
+            channel = guild.get_channel(channel_id)
+            if channel is None:
+                return web.json_response({"error": f"Channel {channel_id} not found"}, status=404)
+
+            if not hasattr(channel, "connect"):
+                return web.json_response({"error": "Not a voice channel"}, status=400)
+
+            try:
+                vc = await channel.connect()
+                await self._start_listening(guild_id, vc)
+                return web.json_response({"status": "joined", "channel": channel.name})
+            except Exception as exc:
+                return web.json_response({"error": str(exc)}, status=500)
+
+        @routes.post("/control/leave")
+        async def control_leave(request: web.Request) -> web.Response:
+            try:
+                data = await request.json()
+                guild_id = int(data.get("guild_id", 0))
+            except Exception as exc:
+                return web.json_response({"error": str(exc)}, status=400)
+
+            guild = self.get_guild(guild_id)
+            if guild is None:
+                return web.json_response({"error": f"Guild {guild_id} not found"}, status=404)
+
+            vc = guild.voice_client
+            if vc is None:
+                return web.json_response({"status": "not_connected"})
+
+            try:
+                await vc.disconnect()
+                return web.json_response({"status": "left"})
+            except Exception as exc:
+                return web.json_response({"error": str(exc)}, status=500)
+
+        @routes.post("/control/speak")
+        async def control_speak(request: web.Request) -> web.Response:
+            try:
+                data = await request.json()
+                guild_id = int(data.get("guild_id", 0))
+                text = str(data.get("text", ""))
+            except Exception as exc:
+                return web.json_response({"error": str(exc)}, status=400)
+
+            if not text:
+                return web.json_response({"error": "text is required"}, status=400)
+
+            pipeline = self._pipelines.get(guild_id)
+            session = self._sessions.get(guild_id)
+            if pipeline is None or session is None:
+                return web.json_response({"error": "Not connected in guild"}, status=404)
+
+            # Synthesize and queue for playback (non-blocking)
+            import concurrent.futures
+
+            loop = asyncio.get_event_loop()
+            try:
+                wav_bytes = await loop.run_in_executor(
+                    None, pipeline.synthesize_response, text
+                )
+                if wav_bytes:
+                    session.playback_queue.put_nowait((wav_bytes, None))
+                    return web.json_response({"status": "queued", "bytes": len(wav_bytes)})
+                else:
+                    return web.json_response({"error": "TTS synthesis failed"}, status=500)
+            except Exception as exc:
+                return web.json_response({"error": str(exc)}, status=500)
+
+        app = web.Application()
+        app.add_routes(routes)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", self._control_port)
+        try:
+            await site.start()
+            log.info(
+                "HTTP control server listening",
+                extra={"port": self._control_port},
+            )
+            # Keep running until cancelled
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            pass
+        except OSError as exc:
+            log.error("HTTP control server failed to start on port %d: %s", self._control_port, exc)
+        finally:
+            await runner.cleanup()
 
     async def on_voice_state_update(
         self,
@@ -1242,12 +1389,14 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
             )
 
     async def _send_to_bel(self, request: str, user_name: str, guild_id: int = 0) -> str | None:
-        """Send a request to Bel via the OpenClaw gateway WebSocket.
+        """Send a request to the main agent (Bel) for escalation.
 
-        Returns Bel's response text, or None on failure/timeout.
+        When ``gateway_port`` is configured (plugin mode), uses the lightweight
+        HTTP escalation client. Falls back to the legacy WebSocket gateway
+        client in standalone mode.
+
+        Returns the agent's response text, or None on failure/timeout.
         """
-        from openclaw_voice.gateway_client import send_to_bel
-
         bot_name = self._pipeline_config.bot_name
         agent_name = self._pipeline_config.main_agent_name
 
@@ -1256,8 +1405,8 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
         guild_name = ctx.get("guild_name", "unknown server")
         voice_channel = ctx.get("voice_channel", "unknown channel")
         text_channel_id = ctx.get("text_channel_id")
-
         text_channel_name = ctx.get("text_channel_name", "unknown")
+
         context_parts = [
             f"[Voice escalation from {bot_name}]",
             f"Discord guild: {guild_name} (ID: {guild_id})",
@@ -1266,7 +1415,6 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
         if text_channel_id:
             context_parts.append(f"Text channel: #{text_channel_name} (ID: {text_channel_id})")
 
-        # Build the instruction block, including channel-post directive if available
         instructions = (
             "Your response will be spoken aloud via TTS — keep it SHORT "
             "(1-3 sentences), no markdown, no links, no code blocks.\n"
@@ -1284,7 +1432,25 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
             f"INSTRUCTIONS:\n"
             f"{instructions}"
         )
-        return await send_to_bel(message, timeout_s=90.0)
+
+        if self._gateway_port is not None:
+            # Plugin mode — use HTTP escalation client (simple, no WebSocket protocol)
+            from openclaw_voice.escalation_http import escalate  # noqa: PLC0415
+
+            channel_id_for_session = ctx.get("text_channel_id") or 0
+            return await escalate(
+                message=message,
+                guild_id=guild_id,
+                channel_id=int(channel_id_for_session),
+                user_id=0,  # voice users don't have a specific user ID in this context
+                gateway_port=self._gateway_port,
+                timeout_s=90.0,
+            )
+        else:
+            # Standalone mode — use WebSocket gateway client
+            from openclaw_voice.gateway_client import send_to_bel  # noqa: PLC0415
+
+            return await send_to_bel(message, timeout_s=90.0)
 
     # ------------------------------------------------------------------
     # Playback worker
@@ -1509,6 +1675,8 @@ def create_bot(
     vad_silence_ms: int = DEFAULT_VAD_SILENCE_MS,
     vad_min_speech_ms: int = DEFAULT_VAD_MIN_SPEECH_MS,
     speech_end_delay_ms: int = 1000,
+    control_port: int = 18790,
+    gateway_port: int | None = None,
 ) -> VoiceBot:
     """Create a configured VoiceBot instance.
 
@@ -1519,6 +1687,8 @@ def create_bot(
         vad_silence_ms:       VAD silence threshold in ms (default 1500).
         vad_min_speech_ms:    VAD minimum speech duration in ms (default 500).
         speech_end_delay_ms:  Silence duration before finalizing speech (default 1000).
+        control_port:         HTTP port for the control/health server (default 18790).
+        gateway_port:         OpenClaw gateway HTTP port for plugin escalation. None = standalone.
 
     Returns:
         Configured VoiceBot ready to run.
@@ -1542,5 +1712,7 @@ def create_bot(
         vad_silence_ms=vad_silence_ms,
         vad_min_speech_ms=vad_min_speech_ms,
         speech_end_delay_ms=speech_end_delay_ms,
+        control_port=control_port,
+        gateway_port=gateway_port,
         intents=intents,
     )

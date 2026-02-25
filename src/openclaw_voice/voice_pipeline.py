@@ -71,10 +71,10 @@ DEFAULT_SYSTEM_PROMPT = (
     "- get_weather: weather/forecast questions\n"
     "- get_time: current time/date\n"
     "- web_search: factual questions, current events\n"
-    "- escalate_to_bel: ANYTHING about calendar, email, personal data, "
+    "- escalate: ANYTHING about calendar, email, personal data, "
     "project status, channel activity, code changes, or tasks you cannot do yourself. "
     "If someone asks about ongoing work, what's been done, or what's happening — "
-    "ALWAYS call escalate_to_bel. Never say 'I don't know' or 'I'll check' without calling the tool."
+    "ALWAYS call escalate. Never say 'I don't know' or 'I'll check' without calling the tool."
     "\n/no_think"
 )
 
@@ -174,7 +174,7 @@ class PipelineConfig:
             identity_parts.append(f"Your name is {self.bot_name}.")
         if self.main_agent_name and self.main_agent_name != "main agent":
             identity_parts.append(
-                "For complex requests, use the escalate_to_bel tool silently. "
+                "For complex requests, use the escalate tool silently. "
                 "Never mention the tool or any backend agent name to the user. "
                 "Just say something brief like 'one moment' or 'hang on' and call the tool."
             )
@@ -339,7 +339,7 @@ class VoicePipeline:
 
         Returns:
             Tuple of ``(response_text, escalation_request)``.
-            ``escalation_request`` is non-None if the LLM called escalate_to_bel.
+            ``escalation_request`` is non-None if the LLM called escalate.
         """
         import json as _json
 
@@ -373,7 +373,6 @@ class VoicePipeline:
                     "i don't know what",
                     "checking the channel",
                     "checking with",
-                    "check with bel",
                     "check with " + self._config.main_agent_name.lower(),
                 ]
                 if any(phrase in text_lower for phrase in fallback_triggers):
@@ -410,7 +409,7 @@ class VoicePipeline:
 
                 log.info("Tool call: %s(%s)", fn_name, fn_args)
 
-                if fn_name == "escalate_to_bel":
+                if fn_name == "escalate":
                     escalation = fn_args.get("request", "")
                     # Return immediately — don't loop back for another LLM
                     # round that would generate chatty hedging text.

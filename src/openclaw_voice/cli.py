@@ -30,6 +30,8 @@ from pathlib import Path
 
 import click
 
+from openclaw_voice.logging_config import setup_logging as _setup_logging_json
+
 log = logging.getLogger("openclaw_voice")
 
 
@@ -85,10 +87,11 @@ _log_level_option = click.option(
 
 
 def _setup_logging(level: str) -> None:
-    logging.basicConfig(
-        level=level.upper(),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    """Configure structured JSON logging at the requested level.
+
+    Respects OPENCLAW_VOICE_DEBUG=true for forced debug output.
+    """
+    _setup_logging_json(level)
 
 
 # ---------------------------------------------------------------------------

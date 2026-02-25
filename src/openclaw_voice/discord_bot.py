@@ -60,7 +60,7 @@ PLAYBACK_QUEUE_MAXSIZE = 10
 
 # If a pipeline response is older than this (seconds since utterance was enqueued)
 # by the time it would play, discard it — the user has moved on.
-MAX_RESPONSE_AGE_S: float = 5.0
+MAX_RESPONSE_AGE_S: float = 20.0
 
 # Default VAD settings — tuned for natural speech with brief pauses
 DEFAULT_VAD_SILENCE_MS = 1500
@@ -232,6 +232,36 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
 
     async def on_ready(self) -> None:
         log.info("VoiceBot ready", extra={"user": str(self.user)})
+
+    async def on_voice_state_update(
+        self,
+        member: discord.Member,
+        before: discord.VoiceState,
+        after: discord.VoiceState,
+    ) -> None:
+        """Detect when a user mutes — treat as end of utterance."""
+        if member.id == self.user.id:
+            return  # ignore our own state changes
+
+        # User just muted (self-mute or server-mute)
+        was_muted = before.self_mute or before.mute
+        is_muted = after.self_mute or after.mute
+
+        if not was_muted and is_muted:
+            guild_id = member.guild.id
+            user_id = str(member.id)
+            vad = self._vads.get((guild_id, user_id))
+            if vad is not None:
+                utterance = vad.flush()
+                if utterance and len(utterance) > FRAME_SIZE * 10:  # at least ~200ms
+                    log.info(
+                        "Mute detected — flushing utterance",
+                        extra={"user_id": user_id, "bytes": len(utterance)},
+                    )
+                    q = self._utterance_queues.get(guild_id)
+                    if q is not None:
+                        self._utterance_seq[user_id] = self._utterance_seq.get(user_id, 0) + 1
+                        await q.put((user_id, utterance, time.time(), self._utterance_seq[user_id]))
 
     # ------------------------------------------------------------------
     # Slash commands

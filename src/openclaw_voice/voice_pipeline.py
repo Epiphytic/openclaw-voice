@@ -39,9 +39,9 @@ log = logging.getLogger("openclaw_voice.voice_pipeline")
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are a voice assistant in a Discord voice channel. "
-    "Keep responses concise and conversational — they will be spoken aloud. "
-    "You can hear who is speaking via speaker identification. "
-    "Current speakers in the channel will be identified by name when possible."
+    "Keep responses SHORT — 1-2 sentences max. They will be spoken aloud. "
+    "Never use lists, bullet points, or markdown. Be natural and conversational. "
+    "If asked a complex question, give a brief answer and offer to elaborate."
 )
 
 
@@ -63,7 +63,7 @@ class PipelineConfig:
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
     llm_timeout: float = 60.0
     llm_temperature: float = 0.7
-    llm_max_tokens: int = 512
+    llm_max_tokens: int = 150
 
     # TTS settings
     tts_voice: str = "af_heart"

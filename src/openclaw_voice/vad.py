@@ -177,6 +177,27 @@ class VoiceActivityDetector:
         )
         return utterance
 
+    def flush(self) -> bytes | None:
+        """Force-flush any buffered speech (e.g. on mute).
+
+        Returns the accumulated utterance bytes, or None if nothing buffered.
+        """
+        if not self._speech_frames:
+            return None
+        utterance = b"".join(self._speech_frames)
+        duration_ms = len(self._speech_frames) * FRAME_DURATION_MS
+        self._speaking = False
+        self._speech_frames = []
+        self._silence_count = 0
+        if duration_ms < self._min_speech_ms:
+            log.debug("Flush discarded — too short (%d ms)", duration_ms)
+            return None
+        log.info(
+            "Utterance force-flushed",
+            extra={"duration_ms": duration_ms, "bytes": len(utterance)},
+        )
+        return utterance
+
     def reset(self) -> None:
         """Reset state, discarding any buffered speech."""
         self._speaking = False

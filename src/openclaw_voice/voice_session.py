@@ -70,6 +70,7 @@ class VoiceSession:
         # Playback
         self.playback_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=playback_queue_maxsize)
         self.tts_cancel: asyncio.Event = asyncio.Event()
+        self.tts_pause: asyncio.Event = asyncio.Event()  # pause playback on noise
 
         # LLM trigger / dedup
         self.pending_llm_trigger: asyncio.Event = asyncio.Event()

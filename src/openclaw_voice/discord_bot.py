@@ -109,6 +109,7 @@ class VoiceSink(Sink):  # type: ignore[misc]
         stt_queue: asyncio.Queue,  # type: ignore[type-arg]
         loop: asyncio.AbstractEventLoop,
         tts_cancel: asyncio.Event | None = None,
+        tts_pause: asyncio.Event | None = None,
         vad_silence_ms: int = DEFAULT_VAD_SILENCE_MS,
         vad_min_speech_ms: int = DEFAULT_VAD_MIN_SPEECH_MS,
         bot_user_id: int = 0,
@@ -121,6 +122,9 @@ class VoiceSink(Sink):  # type: ignore[misc]
         self._stt_queue = stt_queue
         self._loop = loop
         self._tts_cancel = tts_cancel
+        self._tts_pause = tts_pause
+        # Per-user pause resume timers
+        self._pause_resume_timers: dict[int, asyncio.TimerHandle] = {}
         self._vad_silence_ms = vad_silence_ms
         self._vad_min_speech_ms = vad_min_speech_ms
         self._bot_user_id = bot_user_id
@@ -168,27 +172,50 @@ class VoiceSink(Sink):  # type: ignore[misc]
 
         self._buffers[user] = b""
 
-        # VAD-gated barge-in: only cancel TTS when actual speech is detected,
-        # not on background noise, farm sounds, or keyboard clicks.
+        # Two-tier barge-in:
+        #   1. Noise above threshold → PAUSE playback (but don't cancel)
+        #   2. Actual speech confirmed by VAD → CANCEL playback (full barge-in)
+        #   3. Noise subsides without speech → RESUME playback after timeout
         if self._tts_cancel is not None and len(mono_pcm) >= FRAME_SIZE:
             from openclaw_voice.vad import _frame_rms  # noqa: PLC0415
 
-            # Check the first complete 20ms frame for speech
             frame = mono_pcm[:FRAME_SIZE]
             rms = _frame_rms(frame)
-            if rms >= 300:  # Above noise floor — check webrtcvad
+
+            if rms >= 300:  # Above noise floor
+                # Pause playback immediately on any significant audio
+                if hasattr(self, "_tts_pause") and self._tts_pause is not None:
+                    self._loop.call_soon_threadsafe(self._tts_pause.set)
+
+                # Schedule a resume if no speech confirmed within 500ms
+                self._loop.call_soon_threadsafe(self._schedule_pause_resume, user)
+
+                # Check webrtcvad for actual speech — only then fully cancel
                 try:
-                    # Lazy-init a lightweight VAD instance for barge-in detection
                     if not hasattr(self, "_bargein_vad"):
                         import webrtcvad  # noqa: PLC0415
 
-                        self._bargein_vad = webrtcvad.Vad(2)  # moderate aggressiveness
+                        self._bargein_vad = webrtcvad.Vad(2)
                     if self._bargein_vad.is_speech(frame, SAMPLE_RATE):
-                        self._loop.call_soon_threadsafe(self._tts_cancel.set)
+                        # Confirmed speech — full cancel
+                        if not hasattr(self, "_speech_frame_count"):
+                            self._speech_frame_count = {}
+                        self._speech_frame_count[user] = self._speech_frame_count.get(user, 0) + 1
+                        # Require 3 consecutive speech frames (~60ms) to confirm
+                        if self._speech_frame_count.get(user, 0) >= 3:
+                            self._loop.call_soon_threadsafe(self._tts_cancel.set)
+                            self._speech_frame_count[user] = 0
+                    else:
+                        # Not speech — reset consecutive counter
+                        if hasattr(self, "_speech_frame_count"):
+                            self._speech_frame_count[user] = 0
                 except Exception:
-                    # If VAD fails, fall back to RMS-only (high threshold)
                     if rms >= 1000:
                         self._loop.call_soon_threadsafe(self._tts_cancel.set)
+            else:
+                # Below noise floor — reset speech counter
+                if hasattr(self, "_speech_frame_count"):
+                    self._speech_frame_count[user] = 0
 
         # Feed the rolling pre-buffer (always, even during active speech)
         if user not in self._pre_buffers:
@@ -214,6 +241,30 @@ class VoiceSink(Sink):  # type: ignore[misc]
         # Reset the debounce timer. write() is called from pycord's audio
         # thread, so all timer ops go through call_soon_threadsafe.
         self._loop.call_soon_threadsafe(self._schedule_flush, user)
+
+    # Pause-resume timeout: if noise detected but no speech within this window,
+    # resume playback automatically.
+    _PAUSE_RESUME_MS = 500
+
+    def _schedule_pause_resume(self, user: int) -> None:
+        """Schedule a timer to resume playback if no speech is confirmed."""
+        existing = self._pause_resume_timers.pop(user, None)
+        if existing is not None:
+            existing.cancel()
+        self._pause_resume_timers[user] = self._loop.call_later(
+            self._PAUSE_RESUME_MS / 1000.0,
+            self._resume_from_pause,
+            user,
+        )
+
+    def _resume_from_pause(self, user: int) -> None:
+        """Resume playback — noise subsided without confirmed speech."""
+        self._pause_resume_timers.pop(user, None)
+        if self._tts_pause is not None and self._tts_pause.is_set():
+            # Only resume if tts_cancel wasn't set (speech not confirmed)
+            if self._tts_cancel is None or not self._tts_cancel.is_set():
+                self._tts_pause.clear()
+                log.debug("Pause-resume: noise subsided, resuming playback for user %s", user)
 
     def _schedule_flush(self, user: int) -> None:
         """Schedule (or reschedule) the debounce timer on the event loop."""
@@ -979,6 +1030,7 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
             stt_queue=session.stt_queue,
             loop=loop,
             tts_cancel=session.tts_cancel,
+            tts_pause=session.tts_pause,
             vad_silence_ms=self._vad_silence_ms,
             vad_min_speech_ms=self._vad_min_speech_ms,
             bot_user_id=self.user.id,
@@ -1553,13 +1605,32 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
                     source = discord.FFmpegPCMAudio(tmp_path)
                     vc.play(source)
 
-                    # Wait for playback to complete, checking barge-in
+                    # Wait for playback to complete, checking pause + barge-in
                     while vc.is_playing():
                         if session.tts_cancel.is_set():
                             vc.stop()
                             log.info("Barge-in: interrupted playback mid-stream")
                             barged_in = True
                             break
+
+                        # Pause on noise detection — wait for resume or cancel
+                        if session.tts_pause.is_set():
+                            vc.pause()
+                            log.debug("Playback paused — noise detected")
+                            # Wait until either resumed or cancelled
+                            while session.tts_pause.is_set():
+                                if session.tts_cancel.is_set():
+                                    vc.stop()
+                                    log.info("Barge-in during pause: speech confirmed")
+                                    barged_in = True
+                                    break
+                                await asyncio.sleep(0.05)
+                            if barged_in:
+                                break
+                            # Noise subsided — resume playback
+                            vc.resume()
+                            log.debug("Playback resumed — noise subsided")
+
                         await asyncio.sleep(0.05)
 
                     # Post to channel AFTER successful playback (not before)

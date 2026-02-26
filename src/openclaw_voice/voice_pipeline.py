@@ -398,22 +398,30 @@ class VoicePipeline:
             if isinstance(result, str):
                 log.debug("LLM returned text (no tool call): %.100s", result)
 
-                # Quality gate: no tool was called, so ask the local LLM
-                # whether the response actually satisfied the user's request.
-                # If not, escalate instead of returning a vague/hedging answer.
-                if self._should_escalate_response(working_messages, result):
-                    log.info(
-                        "Quality gate escalation — response judged incomplete: %.60s",
-                        result,
-                    )
-                    user_msg = ""
-                    for m in reversed(working_messages):
-                        if m["role"] == "user":
-                            user_msg = m["content"]
-                            break
-                    return "", user_msg or "User asked a question that needs escalation"
+                # No tool was called. Check if this is a simple greeting
+                # that Chip can handle directly. Everything else escalates.
+                user_msg = ""
+                for m in reversed(working_messages):
+                    if m["role"] == "user":
+                        user_msg = m["content"]
+                        break
 
-                return result, escalation
+                user_lower = user_msg.strip().lower().rstrip("!?.")
+                greeting_words = {
+                    "hi", "hey", "hello", "thanks", "thank you", "bye",
+                    "goodbye", "ok", "okay", "sure", "yes", "no", "yep",
+                    "nope", "good morning", "good night", "good evening",
+                }
+                if user_lower in greeting_words:
+                    # Greetings — Chip can handle directly
+                    return result, escalation
+
+                # Everything else without a tool call → auto-escalate
+                log.info(
+                    "No tool call — auto-escalating: %.60s",
+                    user_msg,
+                )
+                return "", user_msg or "User asked a question that needs escalation"
 
             log.info(
                 "LLM returned tool_calls: %s",
@@ -531,60 +539,6 @@ class VoicePipeline:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
-
-    def _should_escalate_response(
-        self,
-        messages: list[dict],
-        response: str,
-    ) -> bool:
-        """Use the local LLM as a quality gate on no-tool-use responses.
-
-        Returns True if the response is judged incomplete/unsatisfying and
-        the interaction should be escalated to the main agent.
-        """
-        # Extract last user message
-        user_msg = ""
-        for m in reversed(messages):
-            if m["role"] == "user":
-                user_msg = m["content"]
-                break
-
-        if not user_msg:
-            return False
-
-        # Simple greetings / acknowledgements don't need escalation
-        user_lower = user_msg.strip().lower().rstrip("!?.")
-        greeting_words = {"hi", "hey", "hello", "thanks", "thank you", "bye", "goodbye", "ok", "okay", "sure", "yes", "no", "yep", "nope"}
-        if user_lower in greeting_words:
-            return False
-
-        judge_prompt = (
-            "You are a quality checker for a voice assistant. A user said something "
-            "and the assistant responded WITHOUT using any tools (no web search, no "
-            "weather lookup, no escalation). Your job: did the assistant actually "
-            "answer the user's question or fulfill their request?\n\n"
-            "Reply with ONLY 'COMPLETE' or 'INCOMPLETE'.\n"
-            "- COMPLETE: The response directly answers the question or naturally "
-            "continues the conversation.\n"
-            "- INCOMPLETE: The response hedges, deflects, says it will check, "
-            "admits it doesn't know, or fails to answer what was asked.\n\n"
-            f"User: {user_msg}\n"
-            f"Assistant: {response}\n\n"
-            "Verdict:"
-        )
-
-        try:
-            judge_messages = [{"role": "user", "content": judge_prompt}]
-            judge_result = self._call_openai_compat(judge_messages, tools=None)
-            if isinstance(judge_result, str):
-                verdict = judge_result.strip().upper()
-                log.debug("Quality gate verdict: %s (user: %.40s, response: %.40s)",
-                          verdict, user_msg, response)
-                return "INCOMPLETE" in verdict
-        except Exception as exc:
-            log.warning("Quality gate LLM call failed, allowing response: %s", exc)
-
-        return False
 
     def _call_openai_compat(
         self,

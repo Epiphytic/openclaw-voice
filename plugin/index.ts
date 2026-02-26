@@ -339,7 +339,7 @@ class VoiceBotProcess {
 
     this.proc = spawn(
       this.pythonPath,
-      ["-m", "openclaw_voice.cli", "discord-bot", "--config-json", "-"],
+      ["-m", "openclaw_voice.cli", "discord-bot", "--config-json"],
       {
         stdio: ["pipe", "inherit", "inherit"],
         env: { ...process.env },

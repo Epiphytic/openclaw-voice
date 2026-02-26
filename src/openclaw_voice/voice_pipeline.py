@@ -53,6 +53,7 @@ import httpx
 from openclaw_voice.facades.kokoro import KokoroFacade
 from openclaw_voice.facades.whisper import WhisperFacade
 from openclaw_voice.tools import TOOL_DEFINITIONS, execute_tool
+from openclaw_voice.tts_normalizer import normalize_for_speech
 
 log = logging.getLogger("openclaw_voice.voice_pipeline")
 
@@ -416,8 +417,14 @@ class VoicePipeline:
         Returns:
             WAV audio bytes, or ``b""`` on failure.
         """
+        normalized = normalize_for_speech(response_text)
+        if normalized != response_text:
+            log.debug(
+                "TTS text normalized",
+                extra={"original_len": len(response_text), "normalized_len": len(normalized)},
+            )
         t_start = time.monotonic()
-        audio = self._synthesize(response_text)
+        audio = self._synthesize(normalized)
         tts_ms = int((time.monotonic() - t_start) * 1000)
         log.info(
             "TTS complete",

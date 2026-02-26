@@ -18,9 +18,10 @@ Transformations are applied in a fixed pipeline order:
 
 Usage::
 
-    from openclaw_voice.tts_normalizer import normalize_for_speech
+    from openclaw_voice.tts_normalizer import normalize_for_speech, chunk_for_tts
 
     clean = normalize_for_speech(raw_text)
+    chunks = chunk_for_tts(clean)
 """
 
 from __future__ import annotations
@@ -304,6 +305,111 @@ def _path_to_speech(path: str) -> str:
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
+
+def chunk_for_tts(text: str, max_chars: int = 300) -> list[str]:
+    """Split text into chunks for individual TTS synthesis.
+
+    Splits at natural boundaries to preserve intonation and inflection.
+    Priority: paragraph > sentence > comma/semicolon > word boundary.
+
+    Args:
+        text: Input text (ideally already normalized via normalize_for_speech).
+        max_chars: Maximum characters per chunk (soft limit — a single word
+            longer than max_chars won't be split further).
+
+    Returns:
+        List of non-empty string chunks, each ideally ≤ max_chars.
+    """
+    if not text or not text.strip():
+        return []
+
+    # ── Step 1: split on paragraph boundaries ──────────────────────────────
+    paragraphs = re.split(r"\n\n+", text)
+    # Strip each paragraph; drop empties
+    paragraphs = [p.strip() for p in paragraphs if p.strip()]
+
+    # ── Step 2: split each paragraph on sentence boundaries ────────────────
+    # Pattern: sentence-ending punctuation followed by space or end of string.
+    _RE_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
+
+    sentences: list[str] = []
+    for para in paragraphs:
+        parts = _RE_SENTENCE_SPLIT.split(para)
+        for part in parts:
+            part = part.strip()
+            if part:
+                sentences.append(part)
+
+    # ── Step 3 & 5 & 6: handle each sentence ───────────────────────────────
+    # If a sentence fits in max_chars → keep whole (rule 3).
+    # If it's too long → split on commas/semicolons (rule 5).
+    # Still too long → split on word boundaries (rule 6).
+    def _split_on_commas(sentence: str) -> list[str]:
+        """Split a long sentence at comma/semicolon boundaries."""
+        # Split but preserve the delimiter in the preceding chunk.
+        parts = re.split(r"(?<=[,;])\s+", sentence)
+        chunks: list[str] = []
+        current = ""
+        for part in parts:
+            if not current:
+                current = part
+            elif len(current) + 1 + len(part) <= max_chars:
+                current += " " + part
+            else:
+                if current:
+                    chunks.append(current)
+                current = part
+        if current:
+            chunks.append(current)
+        return chunks or [sentence]
+
+    def _split_on_words(sentence: str) -> list[str]:
+        """Last-resort word-boundary split for sentences that are too long."""
+        words = sentence.split()
+        chunks: list[str] = []
+        current = ""
+        for word in words:
+            if not current:
+                current = word
+            elif len(current) + 1 + len(word) <= max_chars:
+                current += " " + word
+            else:
+                chunks.append(current)
+                current = word
+        if current:
+            chunks.append(current)
+        return chunks or [sentence]
+
+    raw_chunks: list[str] = []
+    for sentence in sentences:
+        if len(sentence) <= max_chars:
+            raw_chunks.append(sentence)
+        else:
+            comma_chunks = _split_on_commas(sentence)
+            for cc in comma_chunks:
+                if len(cc) <= max_chars:
+                    raw_chunks.append(cc)
+                else:
+                    raw_chunks.extend(_split_on_words(cc))
+
+    # ── Step 4: merge adjacent short chunks ────────────────────────────────
+    # "Short" = less than half of max_chars. Merge pairs until stable.
+    short_threshold = max_chars // 2
+    merged: list[str] = []
+    for chunk in raw_chunks:
+        if (
+            merged
+            and len(merged[-1]) < short_threshold
+            and len(chunk) < short_threshold
+            and len(merged[-1]) + 1 + len(chunk) <= max_chars
+        ):
+            merged[-1] = merged[-1] + " " + chunk
+        else:
+            merged.append(chunk)
+
+    # ── Step 7: strip empty chunks ─────────────────────────────────────────
+    return [c for c in merged if c.strip()]
 
 
 def normalize_for_speech(text: str) -> str:

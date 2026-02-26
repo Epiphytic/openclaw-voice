@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from openclaw_voice.tts_normalizer import normalize_for_speech, _path_to_speech
+from openclaw_voice.tts_normalizer import normalize_for_speech, chunk_for_tts, _path_to_speech
 
 
 # ---------------------------------------------------------------------------
@@ -629,3 +629,158 @@ class TestRealMessages:
 
         # ── Single line ───────────────────────────────────────────────────
         assert "\n" not in result
+
+
+# ---------------------------------------------------------------------------
+# chunk_for_tts
+# ---------------------------------------------------------------------------
+
+
+class TestChunkForTTS:
+    """Tests for chunk_for_tts — sentence/paragraph chunking for TTS synthesis."""
+
+    def test_empty_input_returns_empty_list(self):
+        assert chunk_for_tts("") == []
+
+    def test_whitespace_only_returns_empty_list(self):
+        assert chunk_for_tts("   \n\t  ") == []
+
+    def test_short_text_returns_single_chunk(self):
+        text = "Hello, how are you?"
+        result = chunk_for_tts(text, max_chars=300)
+        assert result == ["Hello, how are you?"]
+
+    def test_text_under_max_chars_is_single_chunk(self):
+        text = "This is a short message that is well under the limit."
+        result = chunk_for_tts(text, max_chars=300)
+        assert len(result) == 1
+        assert result[0] == text
+
+    def test_multi_paragraph_splits_on_blank_lines(self):
+        text = "First paragraph here.\n\nSecond paragraph here."
+        result = chunk_for_tts(text, max_chars=300)
+        # Should produce at least 2 chunks (one per paragraph or merged if short)
+        assert len(result) >= 1
+        combined = " ".join(result)
+        assert "First paragraph" in combined
+        assert "Second paragraph" in combined
+
+    def test_long_paragraph_splits_on_sentences(self):
+        # Build a paragraph with several sentences that together exceed max_chars
+        sentences = [
+            "The quick brown fox jumps over the lazy dog.",
+            "Pack my box with five dozen liquor jugs.",
+            "How vexingly quick daft zebras jump.",
+            "The five boxing wizards jump quickly.",
+        ]
+        text = " ".join(sentences)
+        result = chunk_for_tts(text, max_chars=60)
+        assert len(result) > 1
+        # Each chunk should be at most max_chars (excluding unavoidable overruns)
+        for chunk in result:
+            assert len(chunk) <= 60 or " " not in chunk  # single-word edge case allowed
+        # All content should be preserved
+        combined = " ".join(result)
+        assert "quick brown fox" in combined
+        assert "boxing wizards" in combined
+
+    def test_long_sentence_splits_on_commas(self):
+        # A single sentence with commas, longer than max_chars
+        sentence = (
+            "We need apples, bananas, cherries, dates, elderberries, "
+            "figs, grapes, honeydew, and kiwis."
+        )
+        result = chunk_for_tts(sentence, max_chars=50)
+        assert len(result) > 1
+        combined = " ".join(result)
+        assert "apples" in combined
+        assert "kiwis" in combined
+
+    def test_chunks_never_exceed_max_chars(self):
+        text = (
+            "Alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima. "
+            "Mike november oscar papa quebec romeo sierra tango uniform victor whiskey. "
+            "X-ray yankee zulu and back to alpha again for good measure today."
+        )
+        result = chunk_for_tts(text, max_chars=80)
+        assert len(result) > 0
+        for chunk in result:
+            # Allow single-word edge case (can't split a word)
+            if " " in chunk:
+                assert len(chunk) <= 80, f"Chunk too long: {chunk!r}"
+
+    def test_word_boundary_fallback_for_very_long_word_sequence(self):
+        # 10 long words with no punctuation, forced into small chunks
+        long_words = " ".join(["extraordinary"] * 15)
+        result = chunk_for_tts(long_words, max_chars=50)
+        assert len(result) > 1
+        combined = " ".join(result)
+        assert "extraordinary" in combined
+
+    def test_short_adjacent_chunks_merged(self):
+        # Two very short sentences should merge into one chunk
+        text = "Hi there. How are you?"
+        result = chunk_for_tts(text, max_chars=300)
+        # Both sentences are short — should be merged into a single chunk
+        assert len(result) == 1
+        assert "Hi there" in result[0]
+        assert "How are you" in result[0]
+
+    def test_real_world_message_chunked_reasonably(self):
+        """Real-world bot message from TestMixedContent gets chunked into
+        reasonable pieces (all content present, no chunk exceeds max_chars)."""
+        text = normalize_for_speech(
+            "**flush_delay_s** is set to `250ms` in the pipeline. "
+            "See PR #7 for details. Version v1.3.2 fixes this."
+        )
+        result = chunk_for_tts(text, max_chars=300)
+        assert len(result) >= 1
+        combined = " ".join(result)
+        assert "flush delay s" in combined
+        assert "250 milliseconds" in combined
+        for chunk in result:
+            if " " in chunk:
+                assert len(chunk) <= 300
+
+    def test_three_paragraph_message(self):
+        text = (
+            "This is the first paragraph. It has two sentences.\n\n"
+            "This is the second paragraph. It also has two sentences.\n\n"
+            "And this is the third paragraph, which stands alone."
+        )
+        result = chunk_for_tts(text, max_chars=300)
+        combined = " ".join(result)
+        assert "first paragraph" in combined
+        assert "second paragraph" in combined
+        assert "third paragraph" in combined
+        # No raw newlines in any chunk
+        for chunk in result:
+            assert "\n" not in chunk
+
+    def test_no_empty_chunks_in_output(self):
+        text = "Hello.\n\n\n\nWorld."
+        result = chunk_for_tts(text, max_chars=300)
+        for chunk in result:
+            assert chunk.strip() != ""
+
+    def test_single_sentence_exactly_at_limit(self):
+        # A sentence exactly at max_chars should be a single chunk
+        text = "a" * 100
+        result = chunk_for_tts(text, max_chars=100)
+        assert result == ["a" * 100]
+
+    def test_large_real_bot_response(self):
+        """Simulate a large bot response being chunked into manageable pieces."""
+        text = normalize_for_speech(
+            "**Voice Plugin Status:**\n"
+            "- Chip is **running** right now (process active)\n"
+            "- Repo at **v1.3.2** on main\n"
+            "- **1 open PR** (#5): 1s speech end-detection delay + auto-reconnect on restart\n"
+            "- Branch: `feat/speech-delay-and-reconnect`\n"
+        )
+        result = chunk_for_tts(text, max_chars=200)
+        assert len(result) >= 1
+        combined = " ".join(result)
+        assert "Voice Plugin Status" in combined
+        for chunk in result:
+            assert chunk.strip() != ""

@@ -36,6 +36,7 @@ import time
 from pathlib import Path
 
 from openclaw_voice.conversation_log import LogEntry
+from openclaw_voice.tts_normalizer import normalize_for_speech, chunk_for_tts
 from openclaw_voice.vad import FRAME_SIZE, SAMPLE_RATE, SAMPLE_WIDTH, VoiceActivityDetector
 from openclaw_voice.voice_pipeline import PipelineConfig, VoicePipeline
 from openclaw_voice.voice_session import VoiceSession
@@ -1255,27 +1256,40 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
                     extra={"guild_id": guild_id, "text_preview": text[:60]},
                 )
 
-                # Synthesise in executor (blocking TTS HTTP call)
-                audio = await loop.run_in_executor(None, pipeline.synthesize_response, text)
-
-                # Check if new speech arrived during synthesis
-                if session.tts_cancel.is_set():
-                    session.clear_tts_cancel()
-                    log.info("TTS cancelled by new speech for guild %s", guild_id)
+                # Normalize and chunk for TTS synthesis
+                normalized_text = normalize_for_speech(text)
+                chunks = chunk_for_tts(normalized_text)
+                if not chunks:
+                    log.warning("TTS worker: no chunks after normalization for guild %s", guild_id)
                     continue
 
-                if not audio:
-                    log.warning("TTS returned empty audio for guild %s", guild_id)
-                    continue
-
-                # Queue for playback — tuple of (audio, channel_post_text)
-                # Channel post text is posted AFTER playback completes
+                # Channel post text is posted AFTER the last chunk plays
                 channel_post = getattr(session, "_pending_channel_post", None)
                 session._pending_channel_post = None
-                try:
-                    session.playback_queue.put_nowait((audio, channel_post))
-                except asyncio.QueueFull:
-                    log.warning("Playback queue full for guild %s, dropping TTS audio", guild_id)
+
+                # Synthesise each chunk; cancel between chunks on barge-in
+                for i, chunk in enumerate(chunks):
+                    audio = await loop.run_in_executor(
+                        None, pipeline.synthesize_response, chunk
+                    )
+
+                    # Check if new speech arrived during synthesis
+                    if session.tts_cancel.is_set():
+                        session.clear_tts_cancel()
+                        log.info("TTS cancelled by new speech for guild %s", guild_id)
+                        break
+
+                    if not audio:
+                        log.warning(
+                            "TTS returned empty audio for chunk %d/%d in guild %s",
+                            i + 1, len(chunks), guild_id,
+                        )
+                        continue
+
+                    # Only attach channel_post to the last chunk
+                    post = channel_post if (i == len(chunks) - 1) else None
+                    with contextlib.suppress(asyncio.QueueFull):
+                        session.playback_queue.put_nowait((audio, post))
 
         except asyncio.CancelledError:
             log.debug("TTS worker cancelled for guild %s", guild_id)
@@ -1345,9 +1359,6 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
                 )
                 return
 
-            # Truncate for TTS
-            tts_text = bel_response[:1500] if len(bel_response) > 1500 else bel_response
-
             log.info(
                 "Escalation response received, rendering TTS",
                 extra={"guild_id": guild_id, "response_len": len(bel_response)},
@@ -1364,13 +1375,24 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
             )
 
             # Post Bel's response to the text channel so users have a text record
-            await self._post_to_channel(guild_id, f"🜂 **{agent_name}**: {bel_response}")
+            channel_post = f"🜂 **{agent_name}**: {bel_response}"
+            await self._post_to_channel(guild_id, channel_post)
 
-            # TTS render directly — no rephrase
-            audio = await loop.run_in_executor(None, pipeline.synthesize_response, tts_text)
-            if audio:
-                with contextlib.suppress(asyncio.QueueFull):
-                    session.playback_queue.put_nowait((audio, None))
+            # Normalize and chunk for TTS — no truncation, full response
+            normalized = normalize_for_speech(bel_response)
+            chunks = chunk_for_tts(normalized)
+
+            for i, chunk in enumerate(chunks):
+                audio = await loop.run_in_executor(None, pipeline.synthesize_response, chunk)
+                if session.tts_cancel.is_set():
+                    session.clear_tts_cancel()
+                    log.info("TTS cancelled by barge-in between chunks")
+                    break
+                if audio:
+                    # Only attach channel_post to the last chunk
+                    post = None  # channel already posted above; no post-playback action needed
+                    with contextlib.suppress(asyncio.QueueFull):
+                        session.playback_queue.put_nowait((audio, post))
 
         except asyncio.TimeoutError:
             log.warning("Escalation timed out for guild %s", guild_id)

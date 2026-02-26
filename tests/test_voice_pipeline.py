@@ -79,7 +79,7 @@ class TestPipelineConfig:
         assert cfg.whisper_url == "http://localhost:8001/inference"
         assert cfg.kokoro_url == "http://localhost:8002/v1/audio/speech"
         assert cfg.llm_url == "http://localhost:8000/v1/chat/completions"
-        assert cfg.llm_model == "Qwen/Qwen2.5-32B-Instruct"
+        assert cfg.llm_model == "Qwen/Qwen3-30B-A3B-Instruct-2507"
         assert cfg.tts_voice == "af_heart"
         assert cfg.max_history_turns == 20
         assert not cfg.enable_speaker_id
@@ -96,66 +96,89 @@ class TestPipelineConfig:
 
 
 # ---------------------------------------------------------------------------
-# VoicePipeline init
+# VoicePipeline init (v2: stateless)
 # ---------------------------------------------------------------------------
 
 
 class TestVoicePipelineInit:
     def test_default_config(self):
         pipeline = VoicePipeline()
-        assert pipeline.config.llm_model == "Qwen/Qwen2.5-32B-Instruct"
-        assert pipeline.history == []
+        assert pipeline.config.llm_model == "Qwen/Qwen3-30B-A3B-Instruct-2507"
 
     def test_custom_channel_id(self):
         pipeline = VoicePipeline(channel_id="guild-42-channel-99")
         assert pipeline._channel_id == "guild-42-channel-99"
 
-    def test_history_empty_on_init(self):
+    def test_stateless_no_internal_history(self):
+        """v2 pipeline is stateless — history is owned by ConversationLog, not VoicePipeline."""
         pipeline = VoicePipeline(_make_config())
-        assert pipeline.history == []
+        assert not hasattr(pipeline, "history")
+        assert not hasattr(pipeline, "_history")
 
 
 # ---------------------------------------------------------------------------
-# Full pipeline: mock everything
+# run_stt: mock WhisperFacade
 # ---------------------------------------------------------------------------
 
 
-class TestFullPipeline:
-    def _make_pipeline(self, **kwargs) -> VoicePipeline:
-        return VoicePipeline(config=_make_config(**kwargs), channel_id="test-channel")
-
-    @pytest.fixture
-    def pipeline(self):
-        return self._make_pipeline()
-
-    @patch("openclaw_voice.voice_pipeline.KokoroFacade")
+class TestRunStt:
     @patch("openclaw_voice.voice_pipeline.WhisperFacade")
-    def test_full_pipeline_produces_response(
-        self,
-        mock_whisper_cls,
-        mock_kokoro_cls,
-    ):
-        """Happy path: whisper returns transcript, LLM returns text, kokoro returns audio."""
-        # Mock WhisperFacade
+    def test_returns_transcript(self, mock_whisper_cls):
         mock_whisper = MagicMock()
         mock_whisper.transcribe.return_value = "Hello there"
         mock_whisper_cls.return_value = mock_whisper
 
-        # Mock KokoroFacade — stream_audio is an async generator
-        async def _fake_stream(*args, **kwargs):
-            yield _make_wav(100)
+        pipeline = VoicePipeline(config=_make_config(), channel_id="test")
+        result = pipeline.run_stt(_make_pcm(), user_id="u1")
+        assert result == "Hello there"
 
-        mock_kokoro = MagicMock()
-        mock_kokoro.stream_audio = _fake_stream
-        mock_kokoro_cls.return_value = mock_kokoro
+    @patch("openclaw_voice.voice_pipeline.WhisperFacade")
+    def test_empty_transcript_returns_empty_string(self, mock_whisper_cls):
+        mock_whisper = MagicMock()
+        mock_whisper.transcribe.return_value = ""
+        mock_whisper_cls.return_value = mock_whisper
 
-        pipeline = self._make_pipeline()
+        pipeline = VoicePipeline(config=_make_config(), channel_id="test")
+        result = pipeline.run_stt(_make_pcm(), user_id="u1")
+        assert result == ""
 
-        # Mock LLM call
+    @patch("openclaw_voice.voice_pipeline.WhisperFacade")
+    def test_whisper_exception_returns_empty_string(self, mock_whisper_cls):
+        mock_whisper = MagicMock()
+        mock_whisper.transcribe.side_effect = RuntimeError("Whisper crashed")
+        mock_whisper_cls.return_value = mock_whisper
+
+        pipeline = VoicePipeline(config=_make_config(), channel_id="test")
+        result = pipeline.run_stt(_make_pcm(), user_id="u1")
+        assert result == ""
+
+    @patch("openclaw_voice.voice_pipeline.WhisperFacade")
+    def test_hallucination_filtered(self, mock_whisper_cls):
+        """Known Whisper hallucinations should be filtered to empty string."""
+        mock_whisper = MagicMock()
+        mock_whisper.transcribe.return_value = "thank you for watching"
+        mock_whisper_cls.return_value = mock_whisper
+
+        pipeline = VoicePipeline(config=_make_config(), channel_id="test")
+        result = pipeline.run_stt(_make_pcm(), user_id="u1")
+        assert result == ""
+
+
+# ---------------------------------------------------------------------------
+# call_llm_with_tools: mock httpx.Client
+# ---------------------------------------------------------------------------
+
+
+class TestCallLlmWithTools:
+    @patch("openclaw_voice.voice_pipeline.WhisperFacade")
+    @patch("openclaw_voice.voice_pipeline.KokoroFacade")
+    def test_returns_text_response(self, mock_kokoro_cls, mock_whisper_cls):
+        pipeline = VoicePipeline(config=_make_config(), channel_id="test")
+
         with patch("httpx.Client") as mock_client_cls:
             mock_resp = MagicMock()
             mock_resp.status_code = 200
-            mock_resp.json.return_value = {"choices": [{"message": {"content": "Hi there!"}}]}
+            mock_resp.json.return_value = {"choices": [{"message": {"content": "Hi!"}}]}
             mock_resp.raise_for_status = MagicMock()
             mock_client = MagicMock()
             mock_client.__enter__ = lambda s: mock_client
@@ -163,61 +186,21 @@ class TestFullPipeline:
             mock_client.post.return_value = mock_resp
             mock_client_cls.return_value = mock_client
 
-            transcript, text, audio = pipeline.process_utterance(_make_pcm(), user_id="123")
+            messages = [
+                {"role": "system", "content": "You are a voice assistant."},
+                {"role": "user", "content": "Hello"},
+            ]
+            text, escalation = pipeline.call_llm_with_tools(messages)
 
-        assert text == "Hi there!"
-        assert isinstance(audio, bytes)
-        assert len(audio) > 0
+        assert text == "Hi!"
+        assert escalation is None
 
-    @patch("openclaw_voice.voice_pipeline.KokoroFacade")
     @patch("openclaw_voice.voice_pipeline.WhisperFacade")
-    def test_empty_transcript_returns_empty(self, mock_whisper_cls, mock_kokoro_cls):
-        """Empty transcript → return ('', b'') without calling LLM."""
-        mock_whisper = MagicMock()
-        mock_whisper.transcribe.return_value = ""  # Empty transcript
-        mock_whisper_cls.return_value = mock_whisper
-
-        mock_kokoro = MagicMock()
-        mock_kokoro_cls.return_value = mock_kokoro
-
-        pipeline = self._make_pipeline()
-
-        with patch("httpx.Client") as mock_client_cls:
-            transcript, text, audio = pipeline.process_utterance(_make_pcm(), user_id="456")
-
-        assert text == ""
-        assert audio == b""
-        # LLM should NOT have been called
-        mock_client_cls.assert_not_called()
-
     @patch("openclaw_voice.voice_pipeline.KokoroFacade")
-    @patch("openclaw_voice.voice_pipeline.WhisperFacade")
-    def test_whisper_failure_returns_empty(self, mock_whisper_cls, mock_kokoro_cls):
-        """WhisperFacade returns empty on failure → pipeline returns empty."""
-        mock_whisper = MagicMock()
-        mock_whisper.transcribe.return_value = ""
-        mock_whisper_cls.return_value = mock_whisper
-
-        mock_kokoro_cls.return_value = MagicMock()
-
-        pipeline = self._make_pipeline()
-        transcript, text, audio = pipeline.process_utterance(_make_pcm(), user_id="789")
-        assert text == ""
-        assert audio == b""
-
-    @patch("openclaw_voice.voice_pipeline.KokoroFacade")
-    @patch("openclaw_voice.voice_pipeline.WhisperFacade")
-    def test_llm_service_down_returns_empty(self, mock_whisper_cls, mock_kokoro_cls):
-        """LLM connection error → pipeline returns empty, no crash."""
+    def test_llm_down_returns_empty(self, mock_kokoro_cls, mock_whisper_cls):
         import httpx
 
-        mock_whisper = MagicMock()
-        mock_whisper.transcribe.return_value = "Say something"
-        mock_whisper_cls.return_value = mock_whisper
-
-        mock_kokoro_cls.return_value = MagicMock()
-
-        pipeline = self._make_pipeline()
+        pipeline = VoicePipeline(config=_make_config(), channel_id="test")
 
         with patch("httpx.Client") as mock_client_cls:
             mock_client = MagicMock()
@@ -226,59 +209,46 @@ class TestFullPipeline:
             mock_client.post.side_effect = httpx.ConnectError("Connection refused")
             mock_client_cls.return_value = mock_client
 
-            transcript, text, audio = pipeline.process_utterance(_make_pcm(), user_id="999")
+            messages = [
+                {"role": "system", "content": "You are a voice assistant."},
+                {"role": "user", "content": "Hello"},
+            ]
+            text, escalation = pipeline.call_llm_with_tools(messages)
 
         assert text == ""
-        assert audio == b""
+        assert escalation is None
 
-    @patch("openclaw_voice.voice_pipeline.KokoroFacade")
     @patch("openclaw_voice.voice_pipeline.WhisperFacade")
-    def test_unexpected_exception_returns_empty(self, mock_whisper_cls, mock_kokoro_cls):
-        """Any unexpected exception in the pipeline returns ('', b''), no crash."""
-        mock_whisper = MagicMock()
-        mock_whisper.transcribe.side_effect = RuntimeError("Unexpected crash!")
-        mock_whisper_cls.return_value = mock_whisper
-
-        mock_kokoro_cls.return_value = MagicMock()
-
-        pipeline = self._make_pipeline()
-        transcript, text, audio = pipeline.process_utterance(_make_pcm(), user_id="crash-user")
-        assert text == ""
-        assert audio == b""
-
-
-# ---------------------------------------------------------------------------
-# Conversation history management
-# ---------------------------------------------------------------------------
-
-
-class TestConversationHistory:
-    def _make_pipeline(self, max_turns: int = 5) -> VoicePipeline:
-        return VoicePipeline(
-            config=_make_config(max_history_turns=max_turns),
-            channel_id="hist-test",
-        )
-
     @patch("openclaw_voice.voice_pipeline.KokoroFacade")
-    @patch("openclaw_voice.voice_pipeline.WhisperFacade")
-    def test_history_appends_user_and_assistant(self, mock_whisper_cls, mock_kokoro_cls):
-        """After a successful exchange, history should have user+assistant entries."""
-        mock_whisper = MagicMock()
-        mock_whisper.transcribe.return_value = "Hello"
-        mock_whisper_cls.return_value = mock_whisper
+    def test_escalate_tool_call(self, mock_kokoro_cls, mock_whisper_cls):
+        """LLM calling escalate() returns ('', escalation_request)."""
+        import json
 
-        async def _fake_stream(*args, **kwargs):
-            yield _make_wav(50)
-
-        mock_kokoro = MagicMock()
-        mock_kokoro.stream_audio = _fake_stream
-        mock_kokoro_cls.return_value = mock_kokoro
-
-        pipeline = self._make_pipeline(max_turns=5)
+        pipeline = VoicePipeline(config=_make_config(), channel_id="test")
 
         with patch("httpx.Client") as mock_client_cls:
             mock_resp = MagicMock()
-            mock_resp.json.return_value = {"choices": [{"message": {"content": "Hey!"}}]}
+            mock_resp.status_code = 200
+            mock_resp.json.return_value = {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "escalate",
+                                        "arguments": json.dumps({"request": "Need Bel's help"}),
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ]
+            }
             mock_resp.raise_for_status = MagicMock()
             mock_client = MagicMock()
             mock_client.__enter__ = lambda s: mock_client
@@ -286,135 +256,80 @@ class TestConversationHistory:
             mock_client.post.return_value = mock_resp
             mock_client_cls.return_value = mock_client
 
-            pipeline.process_utterance(_make_pcm(), user_id="u1")
+            messages = [
+                {"role": "system", "content": "You are a voice assistant."},
+                {"role": "user", "content": "Who is Bel?"},
+            ]
+            text, escalation = pipeline.call_llm_with_tools(messages)
 
-        history = pipeline.history
-        assert len(history) == 2
-        assert history[0]["role"] == "user"
-        assert history[0]["content"] == "Hello"
-        assert history[1]["role"] == "assistant"
-        assert history[1]["content"] == "Hey!"
+        assert text == ""
+        assert escalation == "Need Bel's help"
 
-    @patch("openclaw_voice.voice_pipeline.KokoroFacade")
+
+# ---------------------------------------------------------------------------
+# synthesize_response: mock KokoroFacade
+# ---------------------------------------------------------------------------
+
+
+class TestSynthesizeResponse:
     @patch("openclaw_voice.voice_pipeline.WhisperFacade")
-    def test_history_bounded_by_max_turns(self, mock_whisper_cls, mock_kokoro_cls):
-        """History should not exceed max_history_turns * 2 entries."""
-        max_turns = 3
-        pipeline = self._make_pipeline(max_turns=max_turns)
-
-        mock_whisper = MagicMock()
-        mock_whisper.transcribe.return_value = "Hi"
-        mock_whisper_cls.return_value = mock_whisper
-
+    @patch("openclaw_voice.voice_pipeline.KokoroFacade")
+    def test_returns_wav_bytes(self, mock_kokoro_cls, mock_whisper_cls):
         async def _fake_stream(*args, **kwargs):
-            yield _make_wav(50)
+            yield _make_wav(100)
 
         mock_kokoro = MagicMock()
         mock_kokoro.stream_audio = _fake_stream
         mock_kokoro_cls.return_value = mock_kokoro
 
-        with patch("httpx.Client") as mock_client_cls:
-            mock_resp = MagicMock()
-            mock_resp.json.return_value = {"choices": [{"message": {"content": "Hello!"}}]}
-            mock_resp.raise_for_status = MagicMock()
-            mock_client = MagicMock()
-            mock_client.__enter__ = lambda s: mock_client
-            mock_client.__exit__ = MagicMock(return_value=False)
-            mock_client.post.return_value = mock_resp
-            mock_client_cls.return_value = mock_client
+        pipeline = VoicePipeline(config=_make_config(), channel_id="test")
+        result = pipeline.synthesize_response("Hello there!", user_id="u1")
+        assert isinstance(result, bytes)
+        assert len(result) > 0
 
-            # Run more exchanges than max_turns
-            for _ in range(max_turns + 3):
-                pipeline.process_utterance(_make_pcm(), user_id="u1")
-
-        assert len(pipeline.history) <= max_turns * 2
-
-    def test_clear_history(self):
-        pipeline = self._make_pipeline()
-        # Manually inject history
-        pipeline._history.append({"role": "user", "content": "test"})
-        pipeline._history.append({"role": "assistant", "content": "reply"})
-
-        pipeline.clear_history()
-        assert pipeline.history == []
-
-    @patch("openclaw_voice.voice_pipeline.KokoroFacade")
     @patch("openclaw_voice.voice_pipeline.WhisperFacade")
-    def test_failed_llm_does_not_add_to_history(self, mock_whisper_cls, mock_kokoro_cls):
-        """When LLM fails, the user message should be rolled back from history."""
-        import httpx
+    @patch("openclaw_voice.voice_pipeline.KokoroFacade")
+    def test_empty_text_returns_empty(self, mock_kokoro_cls, mock_whisper_cls):
+        pipeline = VoicePipeline(config=_make_config(), channel_id="test")
+        result = pipeline.synthesize_response("", user_id="u1")
+        assert result == b""
 
-        mock_whisper = MagicMock()
-        mock_whisper.transcribe.return_value = "Will this be saved?"
-        mock_whisper_cls.return_value = mock_whisper
-        mock_kokoro_cls.return_value = MagicMock()
+    @patch("openclaw_voice.voice_pipeline.WhisperFacade")
+    @patch("openclaw_voice.voice_pipeline.KokoroFacade")
+    def test_kokoro_failure_returns_empty(self, mock_kokoro_cls, mock_whisper_cls):
+        async def _bad_stream(*args, **kwargs):
+            raise RuntimeError("TTS server down")
+            yield  # make it a generator
 
-        pipeline = self._make_pipeline()
+        mock_kokoro = MagicMock()
+        mock_kokoro.stream_audio = _bad_stream
+        mock_kokoro_cls.return_value = mock_kokoro
 
-        with patch("httpx.Client") as mock_client_cls:
-            mock_client = MagicMock()
-            mock_client.__enter__ = lambda s: mock_client
-            mock_client.__exit__ = MagicMock(return_value=False)
-            mock_client.post.side_effect = httpx.ConnectError("down")
-            mock_client_cls.return_value = mock_client
-
-            pipeline.process_utterance(_make_pcm(), user_id="u1")
-
-        # History should be empty — user message rolled back
-        assert pipeline.history == []
+        pipeline = VoicePipeline(config=_make_config(), channel_id="test")
+        result = pipeline.synthesize_response("Say something", user_id="u1")
+        assert result == b""
 
 
 # ---------------------------------------------------------------------------
-# Speaker ID (optional)
+# Speaker ID integration (run_stt with speaker_id enabled)
 # ---------------------------------------------------------------------------
 
 
 class TestSpeakerIdIntegration:
-    @patch("openclaw_voice.voice_pipeline.KokoroFacade")
     @patch("openclaw_voice.voice_pipeline.WhisperFacade")
-    def test_speaker_id_prefixes_message(self, mock_whisper_cls, mock_kokoro_cls):
-        """When speaker ID is enabled and returns a name, message should be prefixed."""
+    @patch("openclaw_voice.voice_pipeline.KokoroFacade")
+    def test_run_stt_returns_raw_transcript(self, mock_kokoro_cls, mock_whisper_cls):
+        """run_stt returns raw transcript; speaker ID prefixing is the caller's responsibility."""
         mock_whisper = MagicMock()
         mock_whisper.transcribe.return_value = "I have a question"
         mock_whisper_cls.return_value = mock_whisper
-
-        async def _fake_stream(*args, **kwargs):
-            yield _make_wav(50)
-
-        mock_kokoro = MagicMock()
-        mock_kokoro.stream_audio = _fake_stream
-        mock_kokoro_cls.return_value = mock_kokoro
+        mock_kokoro_cls.return_value = MagicMock()
 
         pipeline = VoicePipeline(
             config=_make_config(enable_speaker_id=True),
             channel_id="test",
         )
-
-        with patch("httpx.Client") as mock_client_cls:
-            mock_resp_llm = MagicMock()
-            mock_resp_llm.json.return_value = {"choices": [{"message": {"content": "Answer"}}]}
-            mock_resp_llm.raise_for_status = MagicMock()
-
-            mock_resp_sid = MagicMock()
-            mock_resp_sid.status_code = 200
-            mock_resp_sid.json.return_value = {"speaker": "Liam"}
-            mock_resp_sid.raise_for_status = MagicMock()
-
-            call_count = [0]
-
-            def _post(url, **kwargs):
-                call_count[0] += 1
-                if "identify" in url:
-                    return mock_resp_sid
-                return mock_resp_llm
-
-            mock_client = MagicMock()
-            mock_client.__enter__ = lambda s: mock_client
-            mock_client.__exit__ = MagicMock(return_value=False)
-            mock_client.post.side_effect = _post
-            mock_client_cls.return_value = mock_client
-
-            pipeline.process_utterance(_make_pcm(), user_id="u1")
-
-        history = pipeline.history
-        assert history[0]["content"] == "[Liam]: I have a question"
+        transcript = pipeline.run_stt(_make_pcm(), user_id="u1")
+        # VoicePipeline.run_stt returns the transcript without speaker prefix;
+        # the discord_bot layer is responsible for speaker identification and prefixing.
+        assert transcript == "I have a question"

@@ -175,6 +175,6 @@
         "description": "HTTP port for the Python bot control/health server (default 18790)"
       }
     },
-    "required": ["botToken", "guildIds"]
+    "required": []
   }
 }

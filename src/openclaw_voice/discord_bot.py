@@ -322,6 +322,8 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
         # Per-guild text channel where /join was invoked (overrides global transcript channel)
         self._guild_text_channels: dict[int, int] = {}  # guild_id → channel_id
         self._guild_context: dict[int, dict] = {}  # guild_id → {guild_name, channel, etc.}
+        # Per-guild text channel message cache — seeded on /join, maintained via on_message
+        self._channel_msg_cache: dict[int, collections.deque] = {}  # guild_id → deque of "Author: message"
         self._vad_silence_ms = vad_silence_ms
         self._vad_min_speech_ms = vad_min_speech_ms
         self._speech_end_delay_ms = speech_end_delay_ms
@@ -454,6 +456,7 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
 
             vc = await channel.connect()
             self._guild_text_channels[guild_id] = text_channel_id
+            await self._seed_channel_cache(guild_id, text_channel_id)
             await self._start_listening(guild_id, vc)
             log.info(
                 "Restored voice connection",
@@ -654,6 +657,12 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
         if not text_channel_id or message.channel.id != text_channel_id:
             return
 
+        # Append to channel message cache (skip own messages)
+        if message.author.id != self.user.id and message.content:
+            cache = self._channel_msg_cache.get(guild_id)
+            if cache is not None:
+                cache.append(f"{message.author.display_name}: {message.content}")
+
         # Look up in cast
         cast_entry = self._cast_lookup(message.author.id)
         role = cast_entry["role"]
@@ -809,6 +818,9 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
         except Exception as exc:
             log.warning("Failed to save voice state: %s", exc)
 
+        # Seed text channel message cache from recent history
+        await self._seed_channel_cache(guild_id, ctx.channel_id)
+
         await self._start_listening(guild_id, vc)
         await ctx.respond(f"Joined **{channel.name}**. I'm listening! 🎙️")
         log.info(
@@ -828,6 +840,7 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
         await self._stop_listening(guild_id)
         self._guild_text_channels.pop(guild_id, None)
         self._guild_context.pop(guild_id, None)
+        self._channel_msg_cache.pop(guild_id, None)
 
         # Clear persisted voice state
         try:
@@ -867,6 +880,27 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
             except Exception as exc:
                 log.warning("Failed to read channel memory %s: %s", memory_path, exc)
         return ""
+
+    async def _seed_channel_cache(self, guild_id: int, text_channel_id: int) -> None:
+        """Seed the message cache from recent text channel history (one-time on /join)."""
+        n_ctx = self._pipeline.config.channel_context_messages if self._pipeline else 10
+        try:
+            text_channel = self.get_channel(text_channel_id)
+            if not text_channel:
+                return
+            cache: collections.deque = collections.deque(maxlen=max(n_ctx, 50))
+            lines: list[str] = []
+            async for msg in text_channel.history(limit=n_ctx):
+                if msg.author.id == self.user.id:
+                    continue
+                if msg.content:
+                    lines.append(f"{msg.author.display_name}: {msg.content}")
+            lines.reverse()  # chronological
+            cache.extend(lines)
+            self._channel_msg_cache[guild_id] = cache
+            log.debug("Seeded channel cache for guild %s with %d messages", guild_id, len(cache))
+        except Exception as exc:
+            log.warning("Failed to seed channel cache for guild %s: %s", guild_id, exc)
 
     async def _start_listening(self, guild_id: int, vc: discord.VoiceClient) -> None:
         """Start recording and processing audio in the voice channel."""
@@ -1077,38 +1111,23 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
                 # Snapshot log version before the LLM call
                 _, pre_version = session.log.snapshot()
 
-                # Inject recent text channel messages into the system prompt
+                # Inject recent text channel messages from local cache
                 system_content = session.system_prompt
-                n_ctx = pipeline.config.channel_context_messages
-                if n_ctx > 0:
-                    text_channel_id = self._guild_text_channels.get(guild_id)
-                    if text_channel_id:
-                        try:
-                            text_channel = self.get_channel(text_channel_id)
-                            if text_channel:
-                                ctx_lines: list[str] = []
-                                async for msg in text_channel.history(limit=n_ctx):
-                                    if msg.author.id == self.user.id:
-                                        continue
-                                    if msg.content:
-                                        ctx_lines.append(
-                                            f"{msg.author.display_name}: {msg.content}"
-                                        )
-                                ctx_lines.reverse()  # chronological order
-                                if ctx_lines:
-                                    ch_name = getattr(text_channel, "name", str(text_channel_id))
-                                    header = f"[Text channel #{ch_name} — last {len(ctx_lines)} messages]"
-                                    system_content = (
-                                        session.system_prompt
-                                        + f"\n\n{header}\n"
-                                        + "\n".join(ctx_lines)
-                                    )
-                        except Exception as _ctx_exc:
-                            log.warning(
-                                "Failed to fetch channel context for guild %s: %s",
-                                guild_id,
-                                _ctx_exc,
-                            )
+                cache = self._channel_msg_cache.get(guild_id)
+                if cache:
+                    n_ctx = pipeline.config.channel_context_messages
+                    ctx_lines = list(cache)[-n_ctx:] if n_ctx > 0 else []
+                    if ctx_lines:
+                        text_channel_id = self._guild_text_channels.get(guild_id)
+                        ch_name = self._guild_context.get(guild_id, {}).get(
+                            "text_channel_name", str(text_channel_id or "unknown")
+                        )
+                        header = f"[Text channel #{ch_name} — last {len(ctx_lines)} messages]"
+                        system_content = (
+                            session.system_prompt
+                            + f"\n\n{header}\n"
+                            + "\n".join(ctx_lines)
+                        )
 
                 # Build message list: system prompt + full conversation history
                 messages = [{"role": "system", "content": system_content}]

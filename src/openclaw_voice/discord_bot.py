@@ -1374,9 +1374,8 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
                 )
             )
 
-            # Post Bel's response to the text channel so users have a text record
-            channel_post = f"🜂 **{agent_name}**: {bel_response}"
-            await self._post_to_channel(guild_id, channel_post)
+            # NOTE: The main agent (Bel) already posts to the text channel as part
+            # of its escalation response — no need to duplicate from the voice bot.
 
             # Normalize and chunk for TTS — no truncation, full response
             normalized = normalize_for_speech(bel_response)

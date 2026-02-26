@@ -23,7 +23,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from dataclasses import dataclass, field
 
 from openclaw_voice.conversation_log import ConversationLog, LogEntry
 
@@ -69,9 +68,7 @@ class VoiceSession:
         self.escalation_tasks: dict[str, asyncio.Task] = {}
 
         # Playback
-        self.playback_queue: asyncio.Queue[bytes] = asyncio.Queue(
-            maxsize=playback_queue_maxsize
-        )
+        self.playback_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=playback_queue_maxsize)
         self.tts_cancel: asyncio.Event = asyncio.Event()
 
         # LLM trigger / dedup
@@ -150,7 +147,5 @@ class VoiceSession:
 
     def __repr__(self) -> str:
         return (
-            f"VoiceSession(guild_id={self.guild_id}, "
-            f"log={self.log!r}, "
-            f"active={self.is_active()})"
+            f"VoiceSession(guild_id={self.guild_id}, log={self.log!r}, active={self.is_active()})"
         )

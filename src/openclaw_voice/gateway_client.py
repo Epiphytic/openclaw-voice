@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import hashlib
 import json
 import logging
@@ -70,9 +71,7 @@ def _load_or_create_identity(path: Path = _IDENTITY_PATH) -> dict:
     public_key = private_key.public_key()
 
     pub_pem = public_key.public_bytes(Encoding.PEM, PublicFormat.SubjectPublicKeyInfo).decode()
-    priv_pem = private_key.private_bytes(
-        Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()
-    ).decode()
+    priv_pem = private_key.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()).decode()
     raw = public_key.public_bytes(Encoding.Raw, PublicFormat.Raw)
     device_id = hashlib.sha256(raw).hexdigest()
 
@@ -89,10 +88,8 @@ def _load_or_create_identity(path: Path = _IDENTITY_PATH) -> dict:
     path.parent.mkdir(parents=True, exist_ok=True)
     persist = {k: v for k, v in identity.items() if k != "publicKeyRaw"}
     path.write_text(json.dumps(persist, indent=2) + "\n")
-    try:
+    with contextlib.suppress(OSError):
         path.chmod(0o600)
-    except OSError:
-        pass
 
     log.info("Generated new device identity: %s", device_id[:16])
     return identity
@@ -118,17 +115,19 @@ def _build_auth_payload(
     nonce: str,
 ) -> str:
     """Build the v2 device auth payload string matching gateway expectations."""
-    return "|".join([
-        "v2",
-        device_id,
-        client_id,
-        client_mode,
-        role,
-        ",".join(scopes),
-        str(signed_at_ms),
-        token,
-        nonce,
-    ])
+    return "|".join(
+        [
+            "v2",
+            device_id,
+            client_id,
+            client_mode,
+            role,
+            ",".join(scopes),
+            str(signed_at_ms),
+            token,
+            nonce,
+        ]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -161,9 +160,7 @@ async def send_to_bel(
         log.error("websockets package not installed — pip install websockets")
         return None
 
-    url = gateway_url or os.environ.get(
-        "OPENCLAW_GATEWAY_URL", "wss://127.0.0.1:18789"
-    )
+    url = gateway_url or os.environ.get("OPENCLAW_GATEWAY_URL", "wss://127.0.0.1:18789")
     token = gateway_token or os.environ.get("OPENCLAW_GATEWAY_TOKEN", "")
 
     # Allow self-signed certs for local gateway

@@ -25,18 +25,16 @@ Usage::
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import threading
-import time
 from dataclasses import dataclass, field
 from typing import Any
 
 log = logging.getLogger("openclaw_voice.conversation_log")
 
 # Valid entry kinds
-ENTRY_KINDS = frozenset(
-    {"user_speech", "assistant", "tool_result", "escalation_result", "system"}
-)
+ENTRY_KINDS = frozenset({"user_speech", "assistant", "tool_result", "escalation_result", "system"})
 
 
 @dataclass
@@ -61,8 +59,7 @@ class LogEntry:
     def __post_init__(self) -> None:
         if self.kind not in ENTRY_KINDS:
             raise ValueError(
-                f"Invalid log entry kind {self.kind!r}. "
-                f"Expected one of: {sorted(ENTRY_KINDS)}"
+                f"Invalid log entry kind {self.kind!r}. Expected one of: {sorted(ENTRY_KINDS)}"
             )
 
 
@@ -97,10 +94,8 @@ class ConversationLog:
         """
         if self._condition is None:
             self._condition = asyncio.Condition()
-            try:
+            with contextlib.suppress(RuntimeError):
                 self._loop = asyncio.get_running_loop()
-            except RuntimeError:
-                pass
         return self._condition
 
     def append(self, entry: LogEntry) -> int:
@@ -177,9 +172,7 @@ class ConversationLog:
 
         for entry in entries:
             if entry.kind == "user_speech":
-                messages.append(
-                    {"role": "user", "content": f"{entry.speaker}: {entry.text}"}
-                )
+                messages.append({"role": "user", "content": f"{entry.speaker}: {entry.text}"})
             elif entry.kind == "assistant":
                 messages.append({"role": "assistant", "content": entry.text})
             elif entry.kind in ("tool_result", "escalation_result"):

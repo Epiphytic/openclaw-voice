@@ -183,9 +183,7 @@ class PipelineConfig:
 
         context_parts = []
         if self.default_location:
-            context_parts.append(
-                f"Default location for weather: {self.default_location}."
-            )
+            context_parts.append(f"Default location for weather: {self.default_location}.")
         if self.default_timezone and self.default_timezone != "UTC":
             context_parts.append(f"Default timezone: {self.default_timezone}.")
         if self.extra_context:
@@ -346,7 +344,7 @@ class VoicePipeline:
         escalation: str | None = None
         working_messages = list(messages)  # local copy — don't mutate caller's list
 
-        for round_num in range(max_rounds):
+        for _round_num in range(max_rounds):
             result = self._call_openai_compat(working_messages, tools=TOOL_DEFINITIONS)
 
             if isinstance(result, str):
@@ -493,6 +491,7 @@ class VoicePipeline:
         result = self._call_openai_compat(messages)
         if isinstance(result, str) and result:
             import re
+
             result = re.sub(r"<think>.*?</think>", "", result, flags=re.DOTALL).strip()
             return result
         return bel_response  # fallback: use raw response

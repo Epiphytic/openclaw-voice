@@ -578,10 +578,14 @@ def discord_bot_cmd(
         resolved_guild_ids = [int(g) for g in guild_id]
     elif merged.get("guild_ids"):
         raw_ids = merged["guild_ids"]
-        resolved_guild_ids = [int(g) for g in raw_ids] if isinstance(raw_ids, list) else [int(raw_ids)]
+        resolved_guild_ids = (
+            [int(g) for g in raw_ids] if isinstance(raw_ids, list) else [int(raw_ids)]
+        )
     elif merged.get("guild_id"):
         raw_id = merged["guild_id"]
-        resolved_guild_ids = [int(raw_id)] if isinstance(raw_id, (str, int)) else [int(g) for g in raw_id]
+        resolved_guild_ids = (
+            [int(raw_id)] if isinstance(raw_id, (str, int)) else [int(g) for g in raw_id]
+        )
 
     from openclaw_voice.discord_bot import (
         DEFAULT_VAD_MIN_SPEECH_MS,

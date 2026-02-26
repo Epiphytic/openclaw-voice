@@ -58,6 +58,7 @@ async def escalate(
         log.debug("gateway_port not set, falling back to gateway_client")
         try:
             from openclaw_voice.gateway_client import send_to_bel  # noqa: PLC0415
+
             return await send_to_bel(message, timeout_s=timeout_s)
         except ImportError:
             log.error("gateway_client not available and gateway_port not configured")
@@ -80,23 +81,25 @@ async def escalate(
 
     try:
         timeout = aiohttp.ClientTimeout(total=timeout_s)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(url, json=payload) as resp:
-                if resp.status != 200:
-                    body = await resp.text()
-                    log.error(
-                        "Escalation HTTP error %d: %s",
-                        resp.status,
-                        body[:200],
-                    )
-                    return None
-                data = await resp.json()
-                text = data.get("text") or ""
-                log.info(
-                    "Escalation response received",
-                    extra={"length": len(text)},
+        async with (
+            aiohttp.ClientSession(timeout=timeout) as session,
+            session.post(url, json=payload) as resp,
+        ):
+            if resp.status != 200:
+                body = await resp.text()
+                log.error(
+                    "Escalation HTTP error %d: %s",
+                    resp.status,
+                    body[:200],
                 )
-                return text or None
+                return None
+            data = await resp.json()
+            text = data.get("text") or ""
+            log.info(
+                "Escalation response received",
+                extra={"length": len(text)},
+            )
+            return text or None
     except aiohttp.ClientConnectorError as exc:
         log.error("Cannot connect to OpenClaw plugin at %s: %s", url, exc)
         return None

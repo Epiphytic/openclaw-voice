@@ -35,7 +35,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from openclaw_voice.conversation_log import ConversationLog, LogEntry
+from openclaw_voice.conversation_log import LogEntry
 from openclaw_voice.vad import FRAME_SIZE, SAMPLE_RATE, SAMPLE_WIDTH, VoiceActivityDetector
 from openclaw_voice.voice_pipeline import PipelineConfig, VoicePipeline
 from openclaw_voice.voice_session import VoiceSession
@@ -221,7 +221,9 @@ class VoiceSink(Sink):  # type: ignore[misc]
 
         duration_ms = len(audio) // (SAMPLE_RATE * SAMPLE_WIDTH // 1000)
         if duration_ms < self.MIN_UTTERANCE_MS:
-            log.debug("Debounce flush — too short (%d ms) for user %s, discarding", duration_ms, user)
+            log.debug(
+                "Debounce flush — too short (%d ms) for user %s, discarding", duration_ms, user
+            )
             return
 
         seq = self._user_seqs.get(user, 0) + 1
@@ -392,10 +394,7 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
                     role = "self"
                 elif member.bot:
                     name_lower = (member.display_name or member.name).lower()
-                    if name_lower in (main_name, "belthanior", "bel"):
-                        role = "agent"
-                    else:
-                        role = "bot"
+                    role = "agent" if name_lower in (main_name, "belthanior", "bel") else "bot"
                 else:
                     role = "user"
 
@@ -477,7 +476,6 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
             POST /control/speak    — synthesize and play text
         """
         try:
-            import aiohttp
             from aiohttp import web
         except ImportError:
             log.warning(
@@ -491,12 +489,14 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
         @routes.get("/health")
         async def health(_request: web.Request) -> web.Response:
             active_guilds = list(self._sessions.keys())
-            return web.json_response({
-                "status": "ok",
-                "guilds": active_guilds,
-                "uptime": time.monotonic() - self._start_time,
-                "gateway_port": self._gateway_port,
-            })
+            return web.json_response(
+                {
+                    "status": "ok",
+                    "guilds": active_guilds,
+                    "uptime": time.monotonic() - self._start_time,
+                    "gateway_port": self._gateway_port,
+                }
+            )
 
         @routes.post("/control/join")
         async def control_join(request: web.Request) -> web.Response:
@@ -565,13 +565,10 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
                 return web.json_response({"error": "Not connected in guild"}, status=404)
 
             # Synthesize and queue for playback (non-blocking)
-            import concurrent.futures
 
             loop = asyncio.get_event_loop()
             try:
-                wav_bytes = await loop.run_in_executor(
-                    None, pipeline.synthesize_response, text
-                )
+                wav_bytes = await loop.run_in_executor(None, pipeline.synthesize_response, text)
                 if wav_bytes:
                     session.playback_queue.put_nowait((wav_bytes, None))
                     return web.json_response({"status": "queued", "bytes": len(wav_bytes)})
@@ -669,10 +666,7 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
                 # Check if this is the main agent
                 name_lower = display_name.lower()
                 main_name = self._pipeline_config.main_agent_name.lower()
-                if name_lower in (main_name, "belthanior", "bel"):
-                    role = "agent"
-                else:
-                    role = "bot"
+                role = "agent" if name_lower in (main_name, "belthanior", "bel") else "bot"
             else:
                 role = "user"
             self._cast[message.author.id] = {"name": display_name, "role": role}
@@ -737,9 +731,7 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
             extra={"guild_id": guild_id, "author": display_name, "role": role, "words": word_count},
         )
 
-        audio = await loop.run_in_executor(
-            None, pipeline.synthesize_response, tts_text
-        )
+        audio = await loop.run_in_executor(None, pipeline.synthesize_response, tts_text)
         if audio:
             with contextlib.suppress(asyncio.QueueFull):
                 session.playback_queue.put_nowait((audio, None))
@@ -805,11 +797,15 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
 
         # Persist voice state for auto-reconnect on restart
         try:
-            _VOICE_STATE_FILE.write_text(json.dumps({
-                "guild_id": guild_id,
-                "voice_channel_id": channel.id,
-                "text_channel_id": ctx.channel_id,
-            }))
+            _VOICE_STATE_FILE.write_text(
+                json.dumps(
+                    {
+                        "guild_id": guild_id,
+                        "voice_channel_id": channel.id,
+                        "text_channel_id": ctx.channel_id,
+                    }
+                )
+            )
         except Exception as exc:
             log.warning("Failed to save voice state: %s", exc)
 
@@ -859,7 +855,9 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
 
     def _load_channel_memory(self, channel_id: int) -> str:
         """Load channel memory summary if it exists."""
-        memory_path = Path.home() / ".openclaw" / "workspace" / "memory" / f"discord-{channel_id}.md"
+        memory_path = (
+            Path.home() / ".openclaw" / "workspace" / "memory" / f"discord-{channel_id}.md"
+        )
         if memory_path.is_file():
             try:
                 text = memory_path.read_text().strip()
@@ -1021,9 +1019,7 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
                 )
 
                 if not transcript:
-                    log.debug(
-                        "STT: empty/hallucination (user=%s seq=%d)", user_id, seq
-                    )
+                    log.debug("STT: empty/hallucination (user=%s seq=%d)", user_id, seq)
                     continue
 
                 log.info(
@@ -1051,9 +1047,7 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
                 session.pending_llm_trigger.set()
 
                 # Post transcript to Discord text channel
-                await self._post_to_channel(
-                    guild_id, f"🎙️ **{display_name}**: {transcript}"
-                )
+                await self._post_to_channel(guild_id, f"🎙️ **{display_name}**: {transcript}")
 
         except asyncio.CancelledError:
             log.debug("STT worker cancelled for guild %s", guild_id)
@@ -1156,7 +1150,6 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
                     )
 
                 bot_name = pipeline.config.bot_name
-                agent_name = pipeline.config.main_agent_name
 
                 # Handle escalation tool call
                 if escalation:
@@ -1181,16 +1174,12 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
 
                     # Prune completed escalation tasks
                     session.escalation_tasks = {
-                        k: t
-                        for k, t in session.escalation_tasks.items()
-                        if not t.done()
+                        k: t for k, t in session.escalation_tasks.items() if not t.done()
                     }
                     continue
 
                 if not response_text:
-                    log.warning(
-                        "LLM returned empty response for guild %s", guild_id
-                    )
+                    log.warning("LLM returned empty response for guild %s", guild_id)
                     continue
 
                 # Append assistant entry to log and wake TTS worker
@@ -1245,16 +1234,12 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
                 )
 
                 # Synthesise in executor (blocking TTS HTTP call)
-                audio = await loop.run_in_executor(
-                    None, pipeline.synthesize_response, text
-                )
+                audio = await loop.run_in_executor(None, pipeline.synthesize_response, text)
 
                 # Check if new speech arrived during synthesis
                 if session.tts_cancel.is_set():
                     session.clear_tts_cancel()
-                    log.info(
-                        "TTS cancelled by new speech for guild %s", guild_id
-                    )
+                    log.info("TTS cancelled by new speech for guild %s", guild_id)
                     continue
 
                 if not audio:
@@ -1268,9 +1253,7 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
                 try:
                     session.playback_queue.put_nowait((audio, channel_post))
                 except asyncio.QueueFull:
-                    log.warning(
-                        "Playback queue full for guild %s, dropping TTS audio", guild_id
-                    )
+                    log.warning("Playback queue full for guild %s, dropping TTS audio", guild_id)
 
         except asyncio.CancelledError:
             log.debug("TTS worker cancelled for guild %s", guild_id)
@@ -1300,7 +1283,6 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
             log.warning("Escalation worker: no pipeline for guild %s", guild_id)
             return
 
-        bot_name = pipeline.config.bot_name
         agent_name = pipeline.config.main_agent_name
         loop = asyncio.get_event_loop()
 
@@ -1320,14 +1302,14 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
             if bel_response:
                 stripped = bel_response.strip().upper()
                 if stripped in ("NO_REPLY", "NO", "NOREPLY", "N/A", ""):
-                    log.warning("Escalation returned non-answer: %r — treating as empty", bel_response)
+                    log.warning(
+                        "Escalation returned non-answer: %r — treating as empty", bel_response
+                    )
                     bel_response = None
 
             if not bel_response:
                 fail_text = f"Sorry, I couldn't reach {agent_name}."
-                audio = await loop.run_in_executor(
-                    None, pipeline.synthesize_response, fail_text
-                )
+                audio = await loop.run_in_executor(None, pipeline.synthesize_response, fail_text)
                 if audio:
                     with contextlib.suppress(asyncio.QueueFull):
                         session.playback_queue.put_nowait((audio, None))
@@ -1360,14 +1342,10 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
             )
 
             # Post Bel's response to the text channel so users have a text record
-            await self._post_to_channel(
-                guild_id, f"🜂 **{agent_name}**: {bel_response}"
-            )
+            await self._post_to_channel(guild_id, f"🜂 **{agent_name}**: {bel_response}")
 
             # TTS render directly — no rephrase
-            audio = await loop.run_in_executor(
-                None, pipeline.synthesize_response, tts_text
-            )
+            audio = await loop.run_in_executor(None, pipeline.synthesize_response, tts_text)
             if audio:
                 with contextlib.suppress(asyncio.QueueFull):
                     session.playback_queue.put_nowait((audio, None))
@@ -1375,18 +1353,14 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
         except asyncio.TimeoutError:
             log.warning("Escalation timed out for guild %s", guild_id)
             fail_text = f"{agent_name} is taking too long, try again later."
-            audio = await loop.run_in_executor(
-                None, pipeline.synthesize_response, fail_text
-            )
+            audio = await loop.run_in_executor(None, pipeline.synthesize_response, fail_text)
             if audio:
                 with contextlib.suppress(asyncio.QueueFull):
                     session.playback_queue.put_nowait((audio, None))
         except asyncio.CancelledError:
             log.debug("Escalation worker cancelled for guild %s", guild_id)
         except Exception as exc:
-            log.error(
-                "Escalation worker error for guild %s: %s", guild_id, exc, exc_info=True
-            )
+            log.error("Escalation worker error for guild %s: %s", guild_id, exc, exc_info=True)
 
     async def _send_to_bel(self, request: str, user_name: str, guild_id: int = 0) -> str | None:
         """Send a request to the main agent (Bel) for escalation.
@@ -1398,7 +1372,6 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
         Returns the agent's response text, or None on failure/timeout.
         """
         bot_name = self._pipeline_config.bot_name
-        agent_name = self._pipeline_config.main_agent_name
 
         # Build context header with channel info
         ctx = self._guild_context.get(guild_id, {})

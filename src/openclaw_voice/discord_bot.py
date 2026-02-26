@@ -812,8 +812,12 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
                 log.warning("Failed to summarize channel message: %s", exc)
                 content = " ".join(content.split()[:250]) + "…"
 
-        # Attribution: other speakers get identified, self/agent never reach here
-        tts_text = f"{display_name} says: {content}"
+        # Attribution: other speakers get identified, but the main agent speaks
+        # as Chip (seamless single-entity UX — no "Belthanior says:" prefix).
+        if role == "agent":
+            tts_text = content
+        else:
+            tts_text = f"{display_name} says: {content}"
 
         log.info(
             "Text-to-voice bridge: reading message",

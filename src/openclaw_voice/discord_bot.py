@@ -814,7 +814,10 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
 
         # Attribution: other speakers get identified, but the main agent speaks
         # as Chip (seamless single-entity UX — no "Belthanior says:" prefix).
-        if role == "agent":
+        # Also suppress prefix for any bot whose name matches the main agent.
+        main_name = self._pipeline_config.main_agent_name.lower()
+        author_lower = (display_name or "").lower()
+        if role == "agent" or author_lower in (main_name, "belthanior", "bel"):
             tts_text = content
         else:
             tts_text = f"{display_name} says: {content}"

@@ -764,9 +764,9 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
         # Route by role
         if role == "self":
             return
-        if role == "agent":
-            log.debug("on_message: skipping agent message from %s", display_name)
-            return
+        # Agent messages (e.g. Bel) are read aloud via the text-to-voice bridge.
+        # The escalation worker returns NO_REPLY so Chip's own TTS path doesn't
+        # handle them — the bridge is the correct place to read agent posts.
 
         # Users in voice can hear themselves type — skip
         if role == "user":

@@ -1454,6 +1454,11 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
             # NOTE: The main agent (Bel) already posts to the text channel as part
             # of its escalation response — no need to duplicate from the voice bot.
 
+            # Clear any stale barge-in signals from the wait period —
+            # noise during the escalation wait shouldn't prevent playback.
+            session.clear_tts_cancel()
+            session.tts_pause.clear()
+
             # Normalize and chunk for TTS — no truncation, full response
             normalized = normalize_for_speech(bel_response)
             chunks = chunk_for_tts(normalized)

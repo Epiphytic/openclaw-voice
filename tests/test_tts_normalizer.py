@@ -413,3 +413,219 @@ class TestMixedContent:
         once = norm(text)
         twice = norm(once)
         assert once == twice
+
+
+# ---------------------------------------------------------------------------
+# Real-world Discord messages from the bot
+# ---------------------------------------------------------------------------
+
+
+class TestRealMessages:
+    """Smoke-test the full pipeline against actual messages the bot sends.
+
+    Assertions focus on three properties:
+    1. **No markdown artifacts** — no ``**``, `` ` ``, leading ``#``.
+    2. **No emoji garbage** — emoji characters absent.
+    3. **Key transformations applied** — specific humanised phrases present.
+    """
+
+    def test_real_message_announce_list(self):
+        """Numbered list with bold headers, bare domain links, em-dash prose."""
+        text = (
+            "**Where to announce the Discord voice plugin:**\n\n"
+            "1. **OpenClaw Discord** (discord.com/invite/clawd) — existing community, most engaged audience\n"
+            "2. **OpenClaw docs** (docs.openclaw.ai) — reference page for the plugin\n"
+            "3. **GitHub repo README** — mention voice capability in the feature list\n"
+            "4. **ClawHub** (clawhub.com) — list as a community plugin/skill\n"
+            "5. **LinkedIn** — fits your content system, could be a \"built this\" post\n"
+            "6. **OpenClaw blog** — longer-form write-up if warranted\n\n"
+            "Happy to draft an announcement for any of these."
+        )
+        result = norm(text)
+
+        # ── No markdown artifacts ──────────────────────────────────────────
+        assert "**" not in result
+        assert "`" not in result
+
+        # ── No emoji ──────────────────────────────────────────────────────
+        # (none in input, just ensuring nothing odd appeared)
+
+        # ── Key content preserved ─────────────────────────────────────────
+        assert "Where to announce the Discord voice plugin" in result
+        assert "OpenClaw Discord" in result
+        assert "existing community" in result
+        assert "Happy to draft an announcement" in result
+
+        # ── Prose flows as a single line (no raw newlines) ────────────────
+        assert "\n" not in result
+
+    def test_real_message_sub_agent_status(self):
+        """Bold title + emoji + inline code file paths + time estimate."""
+        text = (
+            "**Building TTS text normalizer** 🔨\n\n"
+            "Sub-agent spawned to:\n"
+            "1. Create `src/openclaw_voice/tts_normalizer.py` — pure stdlib, no external deps\n"
+            "2. Integrate into `voice_pipeline.py` (before Kokoro TTS call)\n"
+            "3. Write comprehensive tests in `tests/test_tts_normalizer.py`\n"
+            "4. Feature branch: `feat/tts-normalizer`\n\n"
+            "**Transforms:** markdown stripping, time units (1s → \"1 second\"), "
+            "code symbols (* → \"star\"), snake_case/camelCase humanization, "
+            "PR refs, file paths, version numbers, emoji stripping\n\n"
+            "ETA ~10-15 min. Will report back when done."
+        )
+        result = norm(text)
+
+        # ── No markdown artifacts ──────────────────────────────────────────
+        assert "**" not in result
+        assert "`" not in result
+
+        # ── Emoji stripped ────────────────────────────────────────────────
+        assert "🔨" not in result
+
+        # ── Bold title content present ────────────────────────────────────
+        assert "Building TTS text normalizer" in result
+
+        # ── File path spoken naturally ────────────────────────────────────
+        # `src/openclaw_voice/tts_normalizer.py` → "src, openclaw voice, tts normalizer dot py"
+        assert "src" in result
+        assert "openclaw voice" in result
+        assert "tts normalizer dot py" in result
+
+        # ── Time unit expanded ────────────────────────────────────────────
+        assert "1 second" in result
+
+        # ── Code symbol expansion (star from "* → star" in prose) ───────────
+        # The message uses Unicode → (\u2192), not ASCII ->; our normaliser
+        # handles ASCII ->  only.  The * before → is expanded to "star".
+        assert "star" in result
+
+        # ── snake_case humanised ──────────────────────────────────────────
+        assert "snake case" in result   # "snake_case" → "snake case"
+        assert "camel case" in result   # "camelCase" → "camel case"
+
+        # ── Single line ───────────────────────────────────────────────────
+        assert "\n" not in result
+
+    def test_real_message_normalizer_plan(self):
+        """Technical planning message with bullet list of transformations,
+        inline code, arrows, bold sections."""
+        text = (
+            "**TTS Code Readability — text normalization, not model swap**\n\n"
+            "This is a preprocessing problem. Kokoro is fine for voice quality — "
+            "we need a normalizer that runs *before* TTS. Key transforms:\n\n"
+            "- `1s` → \"one second\", `250ms` → \"250 milliseconds\"\n"
+            "- `**bold text**` → strip markdown, just say the word\n"
+            "- `_flush_delay_s` → \"flush delay s\" (humanize snake_case)\n"
+            "- `#5` → \"number 5\" / \"PR 5\"\n"
+            "- `*` → \"star\", `->` → \"arrow\", `>=` → \"greater than or equal\"\n"
+            "- Strip code blocks, links, headers\n"
+            "- File paths spoken naturally\n\n"
+            "**Plan:** Build a lightweight Python text normalizer module, "
+            "plug it in before the TTS call in the voice pipeline. Waiting for go-ahead."
+        )
+        result = norm(text)
+
+        # ── No markdown artifacts ──────────────────────────────────────────
+        assert "**" not in result
+        assert "`" not in result
+
+        # ── Bold italic stripped, content kept ────────────────────────────
+        assert "TTS Code Readability" in result
+        assert "text normalization" in result
+
+        # ── Italic stripped, word kept ────────────────────────────────────
+        assert "before" in result   # *before* → before
+
+        # ── Time units expanded (inside inline code) ──────────────────────
+        assert "1 second" in result
+        assert "250 milliseconds" in result
+
+        # ── snake_case humanised (inside inline code) ─────────────────────
+        assert "flush delay s" in result
+
+        # ── Issue ref expanded ────────────────────────────────────────────
+        assert "number 5" in result
+
+        # ── Code symbols expanded ─────────────────────────────────────────
+        assert "star" in result
+        assert "arrow" in result
+        assert "greater than or equal to" in result
+
+        # ── Plan text survives ────────────────────────────────────────────
+        assert "Build a lightweight Python text normalizer module" in result
+
+        # ── Single line ───────────────────────────────────────────────────
+        assert "\n" not in result
+
+    def test_real_message_pr_blocked(self):
+        """PR status message with emoji, bold, issue ref, Python version numbers."""
+        text = (
+            "**Can't merge PR #5** — blocked by:\n"
+            "- ❌ **Merge conflicts** (status: CONFLICTING)\n"
+            "- ❌ **CI failure** on Python 3.11 (3.10 and 3.12 cancelled)\n\n"
+            "Need to resolve conflicts and fix CI before merging. "
+            "Let me know if you want me to work on it."
+        )
+        result = norm(text)
+
+        # ── No markdown artifacts ──────────────────────────────────────────
+        assert "**" not in result
+        assert "`" not in result
+
+        # ── Emoji stripped ────────────────────────────────────────────────
+        assert "❌" not in result
+
+        # ── PR ref handled ────────────────────────────────────────────────
+        # "PR #5" → "PR 5" (# removed, number kept)
+        assert "#" not in result
+        assert "PR 5" in result
+
+        # ── Bold content preserved ────────────────────────────────────────
+        assert "Merge conflicts" in result
+        assert "CI failure" in result
+
+        # ── Trailing prose preserved ──────────────────────────────────────
+        assert "Need to resolve conflicts" in result
+        assert "Let me know" in result
+
+        # ── Single line ───────────────────────────────────────────────────
+        assert "\n" not in result
+
+    def test_real_message_plugin_status(self):
+        """Status summary with version number, issue ref, time unit, inline
+        code branch name."""
+        text = (
+            "**Voice Plugin Status:**\n"
+            "- Chip is **running** right now (process active)\n"
+            "- Repo at **v1.3.2** on main\n"
+            "- **1 open PR** (#5): 1s speech end-detection delay + auto-reconnect on restart\n"
+            "- Branch: `feat/speech-delay-and-reconnect`\n"
+        )
+        result = norm(text)
+
+        # ── No markdown artifacts ──────────────────────────────────────────
+        assert "**" not in result
+        assert "`" not in result
+
+        # ── Bold content preserved ────────────────────────────────────────
+        assert "Voice Plugin Status" in result
+        assert "running" in result
+
+        # ── Version expanded ──────────────────────────────────────────────
+        assert "version 1.3.2" in result
+
+        # ── Issue ref expanded ────────────────────────────────────────────
+        assert "#" not in result
+        assert "number 5" in result
+
+        # ── Time unit expanded ────────────────────────────────────────────
+        assert "1 second" in result
+
+        # ── Branch name (inline code path) spoken naturally ───────────────
+        # `feat/speech-delay-and-reconnect` → inline stripped → path spoken
+        # feat/speech-delay-and-reconnect → "feat, speech delay and reconnect"
+        assert "feat" in result
+        assert "speech" in result
+
+        # ── Single line ───────────────────────────────────────────────────
+        assert "\n" not in result

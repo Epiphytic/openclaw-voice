@@ -1,6 +1,6 @@
 {
   "name": "@epiphytic/openclaw-discord-voice",
-  "version": "1.5.3",
+  "version": "1.5.4",
   "description": "OpenClaw plugin for real-time Discord voice assistant with local LLM, STT, and TTS",
   "type": "module",
   "main": "index.ts",

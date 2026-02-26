@@ -279,6 +279,21 @@ class VoicePipeline:
                 )
                 return ""
 
+            # Strip leading hallucination lines (e.g. repeated "Thank you.")
+            cleaned = self.strip_hallucination_prefix(transcript)
+            if cleaned != transcript:
+                log.info(
+                    "Stripped hallucination prefix",
+                    extra={
+                        "user_id": user_id,
+                        "before": transcript,
+                        "after": cleaned,
+                    },
+                )
+                transcript = cleaned
+                if not transcript:
+                    return ""
+
             # Apply post-STT word corrections
             if self._config._corrections:
                 corrected = _apply_corrections(transcript, self._config._corrections)
@@ -320,6 +335,38 @@ class VoicePipeline:
         if not lines:
             return True  # empty = discard
         return all(ln in _HALLUCINATIONS for ln in lines)
+
+    @staticmethod
+    def strip_hallucination_prefix(transcript: str) -> str:
+        """Strip repeated hallucination lines from the start of a transcript.
+
+        Whisper often prepends phantom phrases (e.g. "Thank you.\\n Thank you.\\n")
+        before real speech when there is silence or background noise at the start
+        of the audio. This strips those leading lines while preserving the real
+        content that follows.
+
+        Args:
+            transcript: Raw Whisper output string.
+
+        Returns:
+            Transcript with leading hallucination lines removed.
+            Returns empty string if nothing remains.
+        """
+        lines = transcript.strip().splitlines()
+        # Find the first line that is NOT a hallucination
+        first_real = None
+        for i, line in enumerate(lines):
+            stripped = line.strip().lower()
+            if stripped and stripped not in _HALLUCINATIONS:
+                first_real = i
+                break
+
+        if first_real is None:
+            return ""  # everything was a hallucination
+
+        # Rejoin from the first real line onward
+        result = "\n".join(lines[first_real:]).strip()
+        return result
 
     def call_llm_with_tools(
         self,

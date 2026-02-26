@@ -1,5 +1,5 @@
 {
-  "id": "discord-voice",
+  "id": "openclaw-discord-voice",
   "name": "Discord Voice",
   "description": "Real-time Discord voice assistant with local LLM, STT, and TTS",
   "version": "0.1.0",

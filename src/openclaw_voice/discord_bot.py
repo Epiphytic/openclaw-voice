@@ -963,7 +963,7 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
 
     async def _seed_channel_cache(self, guild_id: int, text_channel_id: int) -> None:
         """Seed the message cache from recent text channel history (one-time on /join)."""
-        n_ctx = self._pipeline.config.channel_context_messages if self._pipeline else 10
+        n_ctx = self._pipeline_config.channel_context_messages
         try:
             text_channel = self.get_channel(text_channel_id)
             if not text_channel:

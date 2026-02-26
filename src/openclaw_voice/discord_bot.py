@@ -648,20 +648,23 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
             return
 
         guild_id = message.guild.id
+
+        # Always cache messages (cheap deque, useful context even before /join)
+        if message.author.id != self.user.id and message.content:
+            cache = self._channel_msg_cache.get(guild_id)
+            if cache is None:
+                cache = collections.deque(maxlen=50)
+                self._channel_msg_cache[guild_id] = cache
+            cache.append(f"{message.author.display_name}: {message.content}")
+
         session = self._sessions.get(guild_id)
         if session is None:
             return
 
-        # Must match the linked text channel
+        # Must match the linked text channel for TTS bridge
         text_channel_id = self._guild_text_channels.get(guild_id)
         if not text_channel_id or message.channel.id != text_channel_id:
             return
-
-        # Append to channel message cache (skip own messages)
-        if message.author.id != self.user.id and message.content:
-            cache = self._channel_msg_cache.get(guild_id)
-            if cache is not None:
-                cache.append(f"{message.author.display_name}: {message.content}")
 
         # Look up in cast
         cast_entry = self._cast_lookup(message.author.id)

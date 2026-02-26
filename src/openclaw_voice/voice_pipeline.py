@@ -409,6 +409,9 @@ class VoicePipeline:
     def synthesize_response(self, response_text: str, user_id: str = "") -> bytes:
         """Run TTS on a response string. Returns WAV bytes (empty on failure).
 
+        Normalizes text for speech before synthesis (strips markdown, expands
+        symbols/units, humanizes identifiers).
+
         Args:
             response_text: Text to synthesise.
             user_id:       Optional user ID for logging.
@@ -416,8 +419,14 @@ class VoicePipeline:
         Returns:
             WAV audio bytes, or ``b""`` on failure.
         """
+        from openclaw_voice.tts_normalizer import normalize_for_tts
+
+        normalized = normalize_for_tts(response_text)
+        if normalized != response_text:
+            log.debug("TTS normalized: %r → %r", response_text[:80], normalized[:80])
+
         t_start = time.monotonic()
-        audio = self._synthesize(response_text)
+        audio = self._synthesize(normalized)
         tts_ms = int((time.monotonic() - t_start) * 1000)
         log.info(
             "TTS complete",

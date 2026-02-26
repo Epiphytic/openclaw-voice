@@ -110,8 +110,8 @@
       },
       "guildIds": {
         "type": "array",
-        "items": { "type": "number" },
-        "description": "Discord guild IDs"
+        "items": { "type": "string" },
+        "description": "Discord guild IDs (as strings to preserve full precision)"
       },
       "transcriptChannelId": {
         "type": "string",

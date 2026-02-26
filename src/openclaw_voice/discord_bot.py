@@ -155,10 +155,6 @@ class VoiceSink(Sink):  # type: ignore[misc]
         if user == self._bot_user_id:
             return
 
-        # Signal new speech → cancel any in-flight TTS immediately (thread-safe)
-        if self._tts_cancel is not None:
-            self._loop.call_soon_threadsafe(self._tts_cancel.set)
-
         # Accumulate raw data in resample buffer
         buf = self._buffers.get(user, b"") + data
         self._buffers[user] = buf
@@ -171,6 +167,28 @@ class VoiceSink(Sink):  # type: ignore[misc]
             return
 
         self._buffers[user] = b""
+
+        # VAD-gated barge-in: only cancel TTS when actual speech is detected,
+        # not on background noise, farm sounds, or keyboard clicks.
+        if self._tts_cancel is not None and len(mono_pcm) >= FRAME_SIZE:
+            from openclaw_voice.vad import _frame_rms  # noqa: PLC0415
+
+            # Check the first complete 20ms frame for speech
+            frame = mono_pcm[:FRAME_SIZE]
+            rms = _frame_rms(frame)
+            if rms >= 300:  # Above noise floor — check webrtcvad
+                try:
+                    # Lazy-init a lightweight VAD instance for barge-in detection
+                    if not hasattr(self, "_bargein_vad"):
+                        import webrtcvad  # noqa: PLC0415
+
+                        self._bargein_vad = webrtcvad.Vad(2)  # moderate aggressiveness
+                    if self._bargein_vad.is_speech(frame, SAMPLE_RATE):
+                        self._loop.call_soon_threadsafe(self._tts_cancel.set)
+                except Exception:
+                    # If VAD fails, fall back to RMS-only (high threshold)
+                    if rms >= 1000:
+                        self._loop.call_soon_threadsafe(self._tts_cancel.set)
 
         # Feed the rolling pre-buffer (always, even during active speech)
         if user not in self._pre_buffers:

@@ -36,6 +36,7 @@ import time
 from pathlib import Path
 
 from openclaw_voice.conversation_log import LogEntry
+from openclaw_voice.tts_normalizer import normalize_for_speech, chunk_for_tts
 from openclaw_voice.vad import FRAME_SIZE, SAMPLE_RATE, SAMPLE_WIDTH, VoiceActivityDetector
 from openclaw_voice.voice_pipeline import PipelineConfig, VoicePipeline
 from openclaw_voice.voice_session import VoiceSession
@@ -108,6 +109,7 @@ class VoiceSink(Sink):  # type: ignore[misc]
         stt_queue: asyncio.Queue,  # type: ignore[type-arg]
         loop: asyncio.AbstractEventLoop,
         tts_cancel: asyncio.Event | None = None,
+        tts_pause: asyncio.Event | None = None,
         vad_silence_ms: int = DEFAULT_VAD_SILENCE_MS,
         vad_min_speech_ms: int = DEFAULT_VAD_MIN_SPEECH_MS,
         bot_user_id: int = 0,
@@ -120,6 +122,9 @@ class VoiceSink(Sink):  # type: ignore[misc]
         self._stt_queue = stt_queue
         self._loop = loop
         self._tts_cancel = tts_cancel
+        self._tts_pause = tts_pause
+        # Per-user pause resume timers
+        self._pause_resume_timers: dict[int, asyncio.TimerHandle] = {}
         self._vad_silence_ms = vad_silence_ms
         self._vad_min_speech_ms = vad_min_speech_ms
         self._bot_user_id = bot_user_id
@@ -154,14 +159,6 @@ class VoiceSink(Sink):  # type: ignore[misc]
         if user == self._bot_user_id:
             return
 
-        # Signal new speech → cancel any in-flight TTS immediately (thread-safe)
-        if self._tts_cancel is not None:
-            try:
-                self._loop.call_soon_threadsafe(self._tts_cancel.set)
-            except RuntimeError:
-                # Event loop is closed (bot shutting down) — ignore
-                return
-
         # Accumulate raw data in resample buffer
         buf = self._buffers.get(user, b"") + data
         self._buffers[user] = buf
@@ -174,6 +171,58 @@ class VoiceSink(Sink):  # type: ignore[misc]
             return
 
         self._buffers[user] = b""
+
+        # Two-tier barge-in:
+        #   1. Noise above threshold → PAUSE playback (but don't cancel)
+        #   2. Actual speech confirmed by VAD → CANCEL playback (full barge-in)
+        #   3. Noise subsides without speech → RESUME playback after timeout
+        # All call_soon_threadsafe calls are guarded against RuntimeError
+        # (event loop closed during shutdown).
+        if self._tts_cancel is not None and len(mono_pcm) >= FRAME_SIZE:  # noqa: SIM102
+            from openclaw_voice.vad import _frame_rms  # noqa: PLC0415
+
+            frame = mono_pcm[:FRAME_SIZE]
+            rms = _frame_rms(frame)
+
+            try:
+                if rms >= 300:  # Above noise floor
+                    # Pause playback immediately on any significant audio
+                    if hasattr(self, "_tts_pause") and self._tts_pause is not None:
+                        self._loop.call_soon_threadsafe(self._tts_pause.set)
+
+                    # Schedule a resume if no speech confirmed within 500ms
+                    self._loop.call_soon_threadsafe(self._schedule_pause_resume, user)
+
+                    # Check webrtcvad for actual speech — only then fully cancel
+                    try:
+                        if not hasattr(self, "_bargein_vad"):
+                            import webrtcvad  # noqa: PLC0415
+
+                            self._bargein_vad = webrtcvad.Vad(2)
+                        if self._bargein_vad.is_speech(frame, SAMPLE_RATE):
+                            # Confirmed speech — full cancel
+                            if not hasattr(self, "_speech_frame_count"):
+                                self._speech_frame_count = {}
+                            self._speech_frame_count[user] = self._speech_frame_count.get(user, 0) + 1
+                            # Require 3 consecutive speech frames (~60ms) to confirm
+                            if self._speech_frame_count.get(user, 0) >= 3:
+                                self._loop.call_soon_threadsafe(self._tts_cancel.set)
+                                self._speech_frame_count[user] = 0
+                        else:
+                            # Not speech — reset consecutive counter
+                            if hasattr(self, "_speech_frame_count"):
+                                self._speech_frame_count[user] = 0
+                    except RuntimeError:
+                        return  # Event loop closed
+                    except Exception:
+                        if rms >= 1000:
+                            self._loop.call_soon_threadsafe(self._tts_cancel.set)
+                else:
+                    # Below noise floor — reset speech counter
+                    if hasattr(self, "_speech_frame_count"):
+                        self._speech_frame_count[user] = 0
+            except RuntimeError:
+                return  # Event loop closed during shutdown
 
         # Feed the rolling pre-buffer (always, even during active speech)
         if user not in self._pre_buffers:
@@ -198,11 +247,31 @@ class VoiceSink(Sink):  # type: ignore[misc]
 
         # Reset the debounce timer. write() is called from pycord's audio
         # thread, so all timer ops go through call_soon_threadsafe.
-        try:
-            self._loop.call_soon_threadsafe(self._schedule_flush, user)
-        except RuntimeError:
-            # Event loop is closed (bot shutting down) — ignore
-            pass
+        self._loop.call_soon_threadsafe(self._schedule_flush, user)
+
+    # Pause-resume timeout: if noise detected but no speech within this window,
+    # resume playback automatically.
+    _PAUSE_RESUME_MS = 500
+
+    def _schedule_pause_resume(self, user: int) -> None:
+        """Schedule a timer to resume playback if no speech is confirmed."""
+        existing = self._pause_resume_timers.pop(user, None)
+        if existing is not None:
+            existing.cancel()
+        self._pause_resume_timers[user] = self._loop.call_later(
+            self._PAUSE_RESUME_MS / 1000.0,
+            self._resume_from_pause,
+            user,
+        )
+
+    def _resume_from_pause(self, user: int) -> None:
+        """Resume playback — noise subsided without confirmed speech."""
+        self._pause_resume_timers.pop(user, None)
+        if self._tts_pause is not None and self._tts_pause.is_set():
+            # Only resume if tts_cancel wasn't set (speech not confirmed)
+            if self._tts_cancel is None or not self._tts_cancel.is_set():
+                self._tts_pause.clear()
+                log.debug("Pause-resume: noise subsided, resuming playback for user %s", user)
 
     def _schedule_flush(self, user: int) -> None:
         """Schedule (or reschedule) the debounce timer on the event loop."""
@@ -446,9 +515,6 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
         """Auto-reconnect to the last voice channel on restart."""
         if not _VOICE_STATE_FILE.is_file():
             return
-        # Small delay to let Discord connection fully initialize before joining
-        await asyncio.sleep(3)
-        text_channel_id: int | None = None
         try:
             state = json.loads(_VOICE_STATE_FILE.read_text())
             guild_id = state["guild_id"]
@@ -460,13 +526,7 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
                 log.warning("Restore voice state: guild %s not found", guild_id)
                 return
 
-            # Prefer get_channel; fall back to fetch_channel for uncached channels
             channel = guild.get_channel(voice_channel_id)
-            if channel is None:
-                try:
-                    channel = await guild.fetch_channel(voice_channel_id)
-                except Exception:
-                    pass
             if channel is None:
                 log.warning("Restore voice state: voice channel %s not found", voice_channel_id)
                 return
@@ -479,19 +539,8 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
                 "Restored voice connection",
                 extra={"guild_id": guild_id, "channel": channel.name},
             )
-            # Notify text channel of successful reconnect
-            text_ch = self.get_channel(text_channel_id)
-            if text_ch is not None:
-                await text_ch.send(f"✅ Reconnected to **{channel.name}** after restart.")
         except Exception as exc:
             log.warning("Failed to restore voice state: %s", exc)
-            # Notify text channel of failure
-            if text_channel_id is not None:
-                text_ch = self.get_channel(text_channel_id)
-                if text_ch is not None:
-                    await text_ch.send(
-                        f"⚠️ Auto-reconnect failed after restart. Use `/join` to reconnect manually. (Error: {exc})"
-                    )
 
     # ------------------------------------------------------------------
     # HTTP control + health server (plugin mode)
@@ -914,7 +963,7 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
 
     async def _seed_channel_cache(self, guild_id: int, text_channel_id: int) -> None:
         """Seed the message cache from recent text channel history (one-time on /join)."""
-        n_ctx = self._pipeline_config.channel_context_messages
+        n_ctx = self._pipeline.config.channel_context_messages if self._pipeline else 10
         try:
             text_channel = self.get_channel(text_channel_id)
             if not text_channel:
@@ -988,6 +1037,7 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
             stt_queue=session.stt_queue,
             loop=loop,
             tts_cancel=session.tts_cancel,
+            tts_pause=session.tts_pause,
             vad_silence_ms=self._vad_silence_ms,
             vad_min_speech_ms=self._vad_min_speech_ms,
             bot_user_id=self.user.id,
@@ -1283,27 +1333,40 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
                     extra={"guild_id": guild_id, "text_preview": text[:60]},
                 )
 
-                # Synthesise in executor (blocking TTS HTTP call)
-                audio = await loop.run_in_executor(None, pipeline.synthesize_response, text)
-
-                # Check if new speech arrived during synthesis
-                if session.tts_cancel.is_set():
-                    session.clear_tts_cancel()
-                    log.info("TTS cancelled by new speech for guild %s", guild_id)
+                # Normalize and chunk for TTS synthesis
+                normalized_text = normalize_for_speech(text)
+                chunks = chunk_for_tts(normalized_text)
+                if not chunks:
+                    log.warning("TTS worker: no chunks after normalization for guild %s", guild_id)
                     continue
 
-                if not audio:
-                    log.warning("TTS returned empty audio for guild %s", guild_id)
-                    continue
-
-                # Queue for playback — tuple of (audio, channel_post_text)
-                # Channel post text is posted AFTER playback completes
+                # Channel post text is posted AFTER the last chunk plays
                 channel_post = getattr(session, "_pending_channel_post", None)
                 session._pending_channel_post = None
-                try:
-                    session.playback_queue.put_nowait((audio, channel_post))
-                except asyncio.QueueFull:
-                    log.warning("Playback queue full for guild %s, dropping TTS audio", guild_id)
+
+                # Synthesise each chunk; cancel between chunks on barge-in
+                for i, chunk in enumerate(chunks):
+                    audio = await loop.run_in_executor(
+                        None, pipeline.synthesize_response, chunk
+                    )
+
+                    # Check if new speech arrived during synthesis
+                    if session.tts_cancel.is_set():
+                        session.clear_tts_cancel()
+                        log.info("TTS cancelled by new speech for guild %s", guild_id)
+                        break
+
+                    if not audio:
+                        log.warning(
+                            "TTS returned empty audio for chunk %d/%d in guild %s",
+                            i + 1, len(chunks), guild_id,
+                        )
+                        continue
+
+                    # Only attach channel_post to the last chunk
+                    post = channel_post if (i == len(chunks) - 1) else None
+                    with contextlib.suppress(asyncio.QueueFull):
+                        session.playback_queue.put_nowait((audio, post))
 
         except asyncio.CancelledError:
             log.debug("TTS worker cancelled for guild %s", guild_id)
@@ -1373,9 +1436,6 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
                 )
                 return
 
-            # Truncate for TTS
-            tts_text = bel_response[:1500] if len(bel_response) > 1500 else bel_response
-
             log.info(
                 "Escalation response received, rendering TTS",
                 extra={"guild_id": guild_id, "response_len": len(bel_response)},
@@ -1391,14 +1451,24 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
                 )
             )
 
-            # Post Bel's response to the text channel so users have a text record
-            await self._post_to_channel(guild_id, f"🜂 **{agent_name}**: {bel_response}")
+            # NOTE: The main agent (Bel) already posts to the text channel as part
+            # of its escalation response — no need to duplicate from the voice bot.
 
-            # TTS render directly — no rephrase
-            audio = await loop.run_in_executor(None, pipeline.synthesize_response, tts_text)
-            if audio:
-                with contextlib.suppress(asyncio.QueueFull):
-                    session.playback_queue.put_nowait((audio, None))
+            # Normalize and chunk for TTS — no truncation, full response
+            normalized = normalize_for_speech(bel_response)
+            chunks = chunk_for_tts(normalized)
+
+            for i, chunk in enumerate(chunks):
+                audio = await loop.run_in_executor(None, pipeline.synthesize_response, chunk)
+                if session.tts_cancel.is_set():
+                    session.clear_tts_cancel()
+                    log.info("TTS cancelled by barge-in between chunks")
+                    break
+                if audio:
+                    # Only attach channel_post to the last chunk
+                    post = None  # channel already posted above; no post-playback action needed
+                    with contextlib.suppress(asyncio.QueueFull):
+                        session.playback_queue.put_nowait((audio, post))
 
         except asyncio.TimeoutError:
             log.warning("Escalation timed out for guild %s", guild_id)
@@ -1542,13 +1612,32 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
                     source = discord.FFmpegPCMAudio(tmp_path)
                     vc.play(source)
 
-                    # Wait for playback to complete, checking barge-in
+                    # Wait for playback to complete, checking pause + barge-in
                     while vc.is_playing():
                         if session.tts_cancel.is_set():
                             vc.stop()
                             log.info("Barge-in: interrupted playback mid-stream")
                             barged_in = True
                             break
+
+                        # Pause on noise detection — wait for resume or cancel
+                        if session.tts_pause.is_set():
+                            vc.pause()
+                            log.debug("Playback paused — noise detected")
+                            # Wait until either resumed or cancelled
+                            while session.tts_pause.is_set():
+                                if session.tts_cancel.is_set():
+                                    vc.stop()
+                                    log.info("Barge-in during pause: speech confirmed")
+                                    barged_in = True
+                                    break
+                                await asyncio.sleep(0.05)
+                            if barged_in:
+                                break
+                            # Noise subsided — resume playback
+                            vc.resume()
+                            log.debug("Playback resumed — noise subsided")
+
                         await asyncio.sleep(0.05)
 
                     # Post to channel AFTER successful playback (not before)

@@ -53,6 +53,7 @@ import httpx
 from openclaw_voice.facades.kokoro import KokoroFacade
 from openclaw_voice.facades.whisper import WhisperFacade
 from openclaw_voice.tools import TOOL_DEFINITIONS, execute_tool
+from openclaw_voice.tts_normalizer import normalize_for_speech
 
 log = logging.getLogger("openclaw_voice.voice_pipeline")
 
@@ -67,21 +68,12 @@ DEFAULT_SYSTEM_PROMPT = (
     "Never say things like 'let me check with X' or 'I'll have X do that'. "
     "Just say 'one moment' or 'let me check' and call the tool silently."
     "\n\n"
-    "YOUR CAPABILITIES ARE LIMITED. You can ONLY:\n"
-    "- Answer simple questions (weather, time, basic facts)\n"
-    "- Search the web for information\n"
-    "- Escalate everything else\n"
-    "You CANNOT write code, build features, create files, modify systems, "
-    "manage projects, or do any development work. NEVER promise to build, "
-    "implement, or create anything. If someone asks you to do something "
-    "beyond answering questions or searching — escalate immediately.\n\n"
     "TOOLS — you MUST use them, not just talk about them:\n"
     "- get_weather: weather/forecast questions\n"
     "- get_time: current time/date\n"
     "- web_search: factual questions, current events\n"
     "- escalate: ANYTHING about calendar, email, personal data, "
-    "project status, channel activity, code changes, tasks, building things, "
-    "or ANYTHING beyond simple Q&A. "
+    "project status, channel activity, code changes, or tasks you cannot do yourself. "
     "If someone asks about ongoing work, what's been done, or what's happening — "
     "ALWAYS call escalate. Never say 'I don't know' or 'I'll check' without calling the tool."
     "\n/no_think"
@@ -287,6 +279,21 @@ class VoicePipeline:
                 )
                 return ""
 
+            # Strip leading hallucination lines (e.g. repeated "Thank you.")
+            cleaned = self.strip_hallucination_prefix(transcript)
+            if cleaned != transcript:
+                log.info(
+                    "Stripped hallucination prefix",
+                    extra={
+                        "user_id": user_id,
+                        "before": transcript,
+                        "after": cleaned,
+                    },
+                )
+                transcript = cleaned
+                if not transcript:
+                    return ""
+
             # Apply post-STT word corrections
             if self._config._corrections:
                 corrected = _apply_corrections(transcript, self._config._corrections)
@@ -328,6 +335,38 @@ class VoicePipeline:
         if not lines:
             return True  # empty = discard
         return all(ln in _HALLUCINATIONS for ln in lines)
+
+    @staticmethod
+    def strip_hallucination_prefix(transcript: str) -> str:
+        """Strip repeated hallucination lines from the start of a transcript.
+
+        Whisper often prepends phantom phrases (e.g. "Thank you.\\n Thank you.\\n")
+        before real speech when there is silence or background noise at the start
+        of the audio. This strips those leading lines while preserving the real
+        content that follows.
+
+        Args:
+            transcript: Raw Whisper output string.
+
+        Returns:
+            Transcript with leading hallucination lines removed.
+            Returns empty string if nothing remains.
+        """
+        lines = transcript.strip().splitlines()
+        # Find the first line that is NOT a hallucination
+        first_real = None
+        for i, line in enumerate(lines):
+            stripped = line.strip().lower()
+            if stripped and stripped not in _HALLUCINATIONS:
+                first_real = i
+                break
+
+        if first_real is None:
+            return ""  # everything was a hallucination
+
+        # Rejoin from the first real line onward
+        result = "\n".join(lines[first_real:]).strip()
+        return result
 
     def call_llm_with_tools(
         self,
@@ -418,9 +457,6 @@ class VoicePipeline:
     def synthesize_response(self, response_text: str, user_id: str = "") -> bytes:
         """Run TTS on a response string. Returns WAV bytes (empty on failure).
 
-        Normalizes text for speech before synthesis (strips markdown, expands
-        symbols/units, humanizes identifiers).
-
         Args:
             response_text: Text to synthesise.
             user_id:       Optional user ID for logging.
@@ -428,12 +464,12 @@ class VoicePipeline:
         Returns:
             WAV audio bytes, or ``b""`` on failure.
         """
-        from openclaw_voice.tts_normalizer import normalize_for_tts
-
-        normalized = normalize_for_tts(response_text)
+        normalized = normalize_for_speech(response_text)
         if normalized != response_text:
-            log.debug("TTS normalized: %r → %r", response_text[:80], normalized[:80])
-
+            log.debug(
+                "TTS text normalized",
+                extra={"original_len": len(response_text), "normalized_len": len(normalized)},
+            )
         t_start = time.monotonic()
         audio = self._synthesize(normalized)
         tts_ms = int((time.monotonic() - t_start) * 1000)
@@ -529,12 +565,9 @@ class VoicePipeline:
             "answer the user's question or fulfill their request?\n\n"
             "Reply with ONLY 'COMPLETE' or 'INCOMPLETE'.\n"
             "- COMPLETE: The response directly answers the question or naturally "
-            "continues the conversation, AND stays within the assistant's capabilities "
-            "(answering questions, providing info).\n"
+            "continues the conversation.\n"
             "- INCOMPLETE: The response hedges, deflects, says it will check, "
-            "admits it doesn't know, fails to answer what was asked, OR "
-            "promises to build/create/implement/code something (the assistant "
-            "cannot do development work — those requests must be escalated).\n\n"
+            "admits it doesn't know, or fails to answer what was asked.\n\n"
             f"User: {user_msg}\n"
             f"Assistant: {response}\n\n"
             "Verdict:"

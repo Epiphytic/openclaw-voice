@@ -163,6 +163,62 @@ class TestRunStt:
         result = pipeline.run_stt(_make_pcm(), user_id="u1")
         assert result == ""
 
+    @patch("openclaw_voice.voice_pipeline.WhisperFacade")
+    def test_hallucination_prefix_stripped(self, mock_whisper_cls):
+        """Repeated hallucination lines at start should be stripped."""
+        mock_whisper = MagicMock()
+        mock_whisper.transcribe.return_value = (
+            "Thank you.\n Thank you.\n Thank you.\n Okay, read me the last PR."
+        )
+        mock_whisper_cls.return_value = mock_whisper
+
+        pipeline = VoicePipeline(config=_make_config(), channel_id="test")
+        result = pipeline.run_stt(_make_pcm(), user_id="u1")
+        assert "thank you" not in result.lower()
+        assert "read me the last PR" in result
+
+
+# ---------------------------------------------------------------------------
+# strip_hallucination_prefix unit tests
+# ---------------------------------------------------------------------------
+
+
+class TestStripHallucinationPrefix:
+    def test_all_hallucinations_returns_empty(self):
+        text = "Thank you.\n Thank you.\n Thanks."
+        assert VoicePipeline.strip_hallucination_prefix(text) == ""
+
+    def test_leading_hallucinations_stripped(self):
+        text = "Thank you.\n Thank you.\n Okay, let's go."
+        result = VoicePipeline.strip_hallucination_prefix(text)
+        assert result == "Okay, let's go."
+
+    def test_no_hallucinations_unchanged(self):
+        text = "Read me the last PR please."
+        result = VoicePipeline.strip_hallucination_prefix(text)
+        assert result == "Read me the last PR please."
+
+    def test_many_repeated_thank_yous(self):
+        lines = ["Thank you."] * 50 + ["What is the weather?"]
+        text = "\n ".join(lines)
+        result = VoicePipeline.strip_hallucination_prefix(text)
+        assert result == "What is the weather?"
+
+    def test_empty_string(self):
+        assert VoicePipeline.strip_hallucination_prefix("") == ""
+
+    def test_mixed_hallucination_types(self):
+        text = "Thanks.\n Bye.\n Hmm.\n So tell me about the project."
+        result = VoicePipeline.strip_hallucination_prefix(text)
+        assert result == "So tell me about the project."
+
+    def test_preserves_mid_text_hallucination_words(self):
+        """Hallucination words in the middle of real speech should NOT be stripped."""
+        text = "Thank you.\n I want to say thanks for the help.\n What's next?"
+        result = VoicePipeline.strip_hallucination_prefix(text)
+        # "I want to say thanks for the help." is real speech (not in hallucination set)
+        assert "thanks for the help" in result
+
 
 # ---------------------------------------------------------------------------
 # call_llm_with_tools: mock httpx.Client

@@ -176,46 +176,53 @@ class VoiceSink(Sink):  # type: ignore[misc]
         #   1. Noise above threshold → PAUSE playback (but don't cancel)
         #   2. Actual speech confirmed by VAD → CANCEL playback (full barge-in)
         #   3. Noise subsides without speech → RESUME playback after timeout
-        if self._tts_cancel is not None and len(mono_pcm) >= FRAME_SIZE:
+        # All call_soon_threadsafe calls are guarded against RuntimeError
+        # (event loop closed during shutdown).
+        if self._tts_cancel is not None and len(mono_pcm) >= FRAME_SIZE:  # noqa: SIM102
             from openclaw_voice.vad import _frame_rms  # noqa: PLC0415
 
             frame = mono_pcm[:FRAME_SIZE]
             rms = _frame_rms(frame)
 
-            if rms >= 300:  # Above noise floor
-                # Pause playback immediately on any significant audio
-                if hasattr(self, "_tts_pause") and self._tts_pause is not None:
-                    self._loop.call_soon_threadsafe(self._tts_pause.set)
+            try:
+                if rms >= 300:  # Above noise floor
+                    # Pause playback immediately on any significant audio
+                    if hasattr(self, "_tts_pause") and self._tts_pause is not None:
+                        self._loop.call_soon_threadsafe(self._tts_pause.set)
 
-                # Schedule a resume if no speech confirmed within 500ms
-                self._loop.call_soon_threadsafe(self._schedule_pause_resume, user)
+                    # Schedule a resume if no speech confirmed within 500ms
+                    self._loop.call_soon_threadsafe(self._schedule_pause_resume, user)
 
-                # Check webrtcvad for actual speech — only then fully cancel
-                try:
-                    if not hasattr(self, "_bargein_vad"):
-                        import webrtcvad  # noqa: PLC0415
+                    # Check webrtcvad for actual speech — only then fully cancel
+                    try:
+                        if not hasattr(self, "_bargein_vad"):
+                            import webrtcvad  # noqa: PLC0415
 
-                        self._bargein_vad = webrtcvad.Vad(2)
-                    if self._bargein_vad.is_speech(frame, SAMPLE_RATE):
-                        # Confirmed speech — full cancel
-                        if not hasattr(self, "_speech_frame_count"):
-                            self._speech_frame_count = {}
-                        self._speech_frame_count[user] = self._speech_frame_count.get(user, 0) + 1
-                        # Require 3 consecutive speech frames (~60ms) to confirm
-                        if self._speech_frame_count.get(user, 0) >= 3:
+                            self._bargein_vad = webrtcvad.Vad(2)
+                        if self._bargein_vad.is_speech(frame, SAMPLE_RATE):
+                            # Confirmed speech — full cancel
+                            if not hasattr(self, "_speech_frame_count"):
+                                self._speech_frame_count = {}
+                            self._speech_frame_count[user] = self._speech_frame_count.get(user, 0) + 1
+                            # Require 3 consecutive speech frames (~60ms) to confirm
+                            if self._speech_frame_count.get(user, 0) >= 3:
+                                self._loop.call_soon_threadsafe(self._tts_cancel.set)
+                                self._speech_frame_count[user] = 0
+                        else:
+                            # Not speech — reset consecutive counter
+                            if hasattr(self, "_speech_frame_count"):
+                                self._speech_frame_count[user] = 0
+                    except RuntimeError:
+                        return  # Event loop closed
+                    except Exception:
+                        if rms >= 1000:
                             self._loop.call_soon_threadsafe(self._tts_cancel.set)
-                            self._speech_frame_count[user] = 0
-                    else:
-                        # Not speech — reset consecutive counter
-                        if hasattr(self, "_speech_frame_count"):
-                            self._speech_frame_count[user] = 0
-                except Exception:
-                    if rms >= 1000:
-                        self._loop.call_soon_threadsafe(self._tts_cancel.set)
-            else:
-                # Below noise floor — reset speech counter
-                if hasattr(self, "_speech_frame_count"):
-                    self._speech_frame_count[user] = 0
+                else:
+                    # Below noise floor — reset speech counter
+                    if hasattr(self, "_speech_frame_count"):
+                        self._speech_frame_count[user] = 0
+            except RuntimeError:
+                return  # Event loop closed during shutdown
 
         # Feed the rolling pre-buffer (always, even during active speech)
         if user not in self._pre_buffers:

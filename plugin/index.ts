@@ -31,7 +31,7 @@ interface DiscordVoiceConfig {
   enabled?: boolean;
   pythonPath?: string;
   botToken: string;
-  guildIds: number[];
+  guildIds: string[];
   transcriptChannelId?: string;
   llmModel?: string;
   llmUrl?: string;
@@ -459,7 +459,7 @@ export default function register(api: OpenClawPluginApi): void {
 
   const cfg: DiscordVoiceConfig = {
     botToken: (raw.botToken as string) ?? "",
-    guildIds: (raw.guildIds as number[]) ?? [],
+    guildIds: ((raw.guildIds as (number | string)[]) ?? []).map(String),
     transcriptChannelId: raw.transcriptChannelId as string | undefined,
     llmModel: raw.llmModel as string | undefined,
     llmUrl: raw.llmUrl as string | undefined,
@@ -575,8 +575,8 @@ export default function register(api: OpenClawPluginApi): void {
       label: "Voice Join",
       description: "Join a Discord voice channel. The voice bot will connect and start listening.",
       parameters: Type.Object({
-        guild_id: Type.Number({ description: "Discord guild (server) ID" }),
-        channel_id: Type.Number({ description: "Discord voice channel ID" }),
+        guild_id: Type.String({ description: "Discord guild (server) ID" }),
+        channel_id: Type.String({ description: "Discord voice channel ID" }),
       }),
       async execute(_id, params) {
         if (!botManager) {
@@ -602,7 +602,7 @@ export default function register(api: OpenClawPluginApi): void {
       label: "Voice Leave",
       description: "Disconnect the voice bot from a Discord voice channel.",
       parameters: Type.Object({
-        guild_id: Type.Number({ description: "Discord guild (server) ID" }),
+        guild_id: Type.String({ description: "Discord guild (server) ID" }),
       }),
       async execute(_id, params) {
         if (!botManager) {
@@ -625,7 +625,7 @@ export default function register(api: OpenClawPluginApi): void {
       label: "Voice Speak",
       description: "Synthesize text and play it in a Discord voice channel.",
       parameters: Type.Object({
-        guild_id: Type.Number({ description: "Discord guild (server) ID" }),
+        guild_id: Type.String({ description: "Discord guild (server) ID" }),
         text: Type.String({ description: "Text to synthesize and play" }),
       }),
       async execute(_id, params) {

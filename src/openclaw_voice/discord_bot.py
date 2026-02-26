@@ -156,7 +156,11 @@ class VoiceSink(Sink):  # type: ignore[misc]
 
         # Signal new speech → cancel any in-flight TTS immediately (thread-safe)
         if self._tts_cancel is not None:
-            self._loop.call_soon_threadsafe(self._tts_cancel.set)
+            try:
+                self._loop.call_soon_threadsafe(self._tts_cancel.set)
+            except RuntimeError:
+                # Event loop is closed (bot shutting down) — ignore
+                return
 
         # Accumulate raw data in resample buffer
         buf = self._buffers.get(user, b"") + data
@@ -194,7 +198,11 @@ class VoiceSink(Sink):  # type: ignore[misc]
 
         # Reset the debounce timer. write() is called from pycord's audio
         # thread, so all timer ops go through call_soon_threadsafe.
-        self._loop.call_soon_threadsafe(self._schedule_flush, user)
+        try:
+            self._loop.call_soon_threadsafe(self._schedule_flush, user)
+        except RuntimeError:
+            # Event loop is closed (bot shutting down) — ignore
+            pass
 
     def _schedule_flush(self, user: int) -> None:
         """Schedule (or reschedule) the debounce timer on the event loop."""
@@ -438,6 +446,9 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
         """Auto-reconnect to the last voice channel on restart."""
         if not _VOICE_STATE_FILE.is_file():
             return
+        # Small delay to let Discord connection fully initialize before joining
+        await asyncio.sleep(3)
+        text_channel_id: int | None = None
         try:
             state = json.loads(_VOICE_STATE_FILE.read_text())
             guild_id = state["guild_id"]
@@ -449,7 +460,13 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
                 log.warning("Restore voice state: guild %s not found", guild_id)
                 return
 
+            # Prefer get_channel; fall back to fetch_channel for uncached channels
             channel = guild.get_channel(voice_channel_id)
+            if channel is None:
+                try:
+                    channel = await guild.fetch_channel(voice_channel_id)
+                except Exception:
+                    pass
             if channel is None:
                 log.warning("Restore voice state: voice channel %s not found", voice_channel_id)
                 return
@@ -462,8 +479,19 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
                 "Restored voice connection",
                 extra={"guild_id": guild_id, "channel": channel.name},
             )
+            # Notify text channel of successful reconnect
+            text_ch = self.get_channel(text_channel_id)
+            if text_ch is not None:
+                await text_ch.send(f"✅ Reconnected to **{channel.name}** after restart.")
         except Exception as exc:
             log.warning("Failed to restore voice state: %s", exc)
+            # Notify text channel of failure
+            if text_channel_id is not None:
+                text_ch = self.get_channel(text_channel_id)
+                if text_ch is not None:
+                    await text_ch.send(
+                        f"⚠️ Auto-reconnect failed after restart. Use `/join` to reconnect manually. (Error: {exc})"
+                    )
 
     # ------------------------------------------------------------------
     # HTTP control + health server (plugin mode)
@@ -886,7 +914,7 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
 
     async def _seed_channel_cache(self, guild_id: int, text_channel_id: int) -> None:
         """Seed the message cache from recent text channel history (one-time on /join)."""
-        n_ctx = self._pipeline.config.channel_context_messages if self._pipeline else 10
+        n_ctx = self._pipeline_config.channel_context_messages
         try:
             text_channel = self.get_channel(text_channel_id)
             if not text_channel:

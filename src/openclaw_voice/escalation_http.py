@@ -66,7 +66,7 @@ async def escalate(
 
     import aiohttp  # type: ignore[import]
 
-    url = f"http://127.0.0.1:{gateway_port}/rpc/discord-voice.escalate"
+    url = f"https://127.0.0.1:{gateway_port}/rpc/discord-voice.escalate"
     payload = {
         "message": message,
         "guildId": str(guild_id),
@@ -80,9 +80,15 @@ async def escalate(
     )
 
     try:
+        import ssl
+
+        ssl_ctx = ssl.create_default_context()
+        ssl_ctx.check_hostname = False
+        ssl_ctx.verify_mode = ssl.CERT_NONE
+        connector = aiohttp.TCPConnector(ssl=ssl_ctx)
         timeout = aiohttp.ClientTimeout(total=timeout_s)
         async with (
-            aiohttp.ClientSession(timeout=timeout) as session,
+            aiohttp.ClientSession(timeout=timeout, connector=connector) as session,
             session.post(url, json=payload) as resp,
         ):
             if resp.status != 200:

@@ -556,6 +556,7 @@ class VoicePipeline:
             "messages": messages,
             "temperature": self._config.llm_temperature,
             "max_tokens": self._config.llm_max_tokens,
+            "chat_template_kwargs": {"enable_thinking": False},
         }
         if tools:
             payload["tools"] = tools

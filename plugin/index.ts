@@ -499,6 +499,7 @@ export default function register(api: OpenClawPluginApi): void {
   // -------------------------------------------------------------------------
   api.registerHttpRoute({
     path: "/rpc/discord-voice.escalate",
+    auth: "gateway",
     handler: async (req, res) => {
       if (req.method !== "POST") {
         sendJson(res, 405, { error: "Method Not Allowed" });

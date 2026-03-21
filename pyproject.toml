@@ -84,6 +84,9 @@ known-first-party = ["openclaw_voice"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 addopts = "-v"
+markers = [
+    "integration: end-to-end tests requiring live services (control server, Discord)",
+]
 
 [tool.mypy]
 python_version = "3.10"

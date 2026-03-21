@@ -28,6 +28,7 @@
 | `VoicePipeline` | `src/openclaw_voice/voice_pipeline.py` | Orchestrates STT → LLM → TTS pipeline for Discord voice. Maintains per-channel conversation history. Returns (transcript, response_text, response_audio). Logs per-stage timing (stt_ms, llm_ms, tts_ms, total_ms). | `httpx`, `WhisperFacade`, `KokoroFacade` | N (stateful) |
 | `VoiceBot` | `src/openclaw_voice/discord_bot.py` | Discord voice channel bot (py-cord). Slash commands: /join, /leave, /voice. Per-user VAD + VoicePipeline per guild. Per-user Task dispatch with cancellation (new utterance cancels in-flight response). Max response age guard (5s). Transcript posting to a configurable Discord channel. | `py-cord[voice]`, `PyNaCl`, `VoicePipeline`, `VoiceActivityDetector` | N (Long-running) |
 | `create_bot()` | `src/openclaw_voice/discord_bot.py` | Factory function for VoiceBot with sane intents defaults. Accepts transcript_channel_id, vad_silence_ms, vad_min_speech_ms. | `py-cord` | Y |
+| `build_test_routes()` | `src/openclaw_voice/test_endpoints.py` | Builds aiohttp /test/* routes for pipeline E2E testing (health, pipeline, STT). Mounted on the control server alongside existing routes. | `aiohttp`, `httpx` | Y |
 
 ---
 

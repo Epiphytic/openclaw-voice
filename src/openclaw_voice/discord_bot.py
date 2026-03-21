@@ -36,7 +36,7 @@ import time
 from pathlib import Path
 
 from openclaw_voice.conversation_log import LogEntry
-from openclaw_voice.tts_normalizer import normalize_for_speech, chunk_for_tts
+from openclaw_voice.tts_normalizer import chunk_for_tts, normalize_for_speech
 from openclaw_voice.vad import FRAME_SIZE, SAMPLE_RATE, SAMPLE_WIDTH, VoiceActivityDetector
 from openclaw_voice.voice_pipeline import PipelineConfig, VoicePipeline
 from openclaw_voice.voice_session import VoiceSession
@@ -203,7 +203,9 @@ class VoiceSink(Sink):  # type: ignore[misc]
                             # Confirmed speech — full cancel
                             if not hasattr(self, "_speech_frame_count"):
                                 self._speech_frame_count = {}
-                            self._speech_frame_count[user] = self._speech_frame_count.get(user, 0) + 1
+                            self._speech_frame_count[user] = (
+                                self._speech_frame_count.get(user, 0) + 1
+                            )
                             # Require 3 consecutive speech frames (~60ms) to confirm
                             if self._speech_frame_count.get(user, 0) >= 3:
                                 self._loop.call_soon_threadsafe(self._tts_cancel.set)
@@ -400,7 +402,9 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
         self._guild_text_channels: dict[int, int] = {}  # guild_id → channel_id
         self._guild_context: dict[int, dict] = {}  # guild_id → {guild_name, channel, etc.}
         # Per-guild text channel message cache — seeded on /join, maintained via on_message
-        self._channel_msg_cache: dict[int, collections.deque] = {}  # guild_id → deque of "Author: message"
+        self._channel_msg_cache: dict[
+            int, collections.deque
+        ] = {}  # guild_id → deque of "Author: message"
         self._vad_silence_ms = vad_silence_ms
         self._vad_min_speech_ms = vad_min_speech_ms
         self._speech_end_delay_ms = speech_end_delay_ms
@@ -659,6 +663,30 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
 
         app = web.Application()
         app.add_routes(routes)
+
+        from openclaw_voice.test_endpoints import build_test_routes
+
+        def _get_first_pipeline():
+            """Return the first available VoicePipeline, or None."""
+            for gid in self._pipelines:
+                return self._pipelines[gid]
+            return None
+
+        class _PipelineProxy:
+            """Proxy that always resolves to the current first pipeline."""
+
+            def __getattr__(self, name):
+                p = _get_first_pipeline()
+                if p is None:
+                    raise AttributeError("No pipeline available")
+                return getattr(p, name)
+
+            def __bool__(self):
+                return _get_first_pipeline() is not None
+
+        test_routes = build_test_routes(pipeline=_PipelineProxy())
+        app.add_routes(test_routes)
+
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.TCPSite(runner, "127.0.0.1", self._control_port)
@@ -875,45 +903,47 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
         channel = ctx.author.voice.channel
         guild_id = ctx.guild_id
 
-        # Disconnect from any existing channel in this guild
-        existing = ctx.guild.voice_client
-        if existing:
-            await self._stop_listening(guild_id)
-            await existing.disconnect(force=True)
-
+        await ctx.defer()
         try:
+            # Disconnect from any existing channel in this guild
+            existing = ctx.guild.voice_client
+            if existing:
+                await self._stop_listening(guild_id)
+                await existing.disconnect(force=True)
+
             vc = await channel.connect()
-        except Exception as exc:
-            log.error("Failed to connect to voice channel: %s", exc)
-            await ctx.respond(f"Failed to join: {exc}", ephemeral=True)
-            return
 
-        # Remember the text channel where /join was invoked for transcripts
-        self._guild_text_channels[guild_id] = ctx.channel_id
+            # Remember the text channel where /join was invoked for transcripts
+            self._guild_text_channels[guild_id] = ctx.channel_id
 
-        # Persist voice state for auto-reconnect on restart
-        try:
-            _VOICE_STATE_FILE.write_text(
-                json.dumps(
-                    {
-                        "guild_id": guild_id,
-                        "voice_channel_id": channel.id,
-                        "text_channel_id": ctx.channel_id,
-                    }
+            # Persist voice state for auto-reconnect on restart
+            try:
+                _VOICE_STATE_FILE.write_text(
+                    json.dumps(
+                        {
+                            "guild_id": guild_id,
+                            "voice_channel_id": channel.id,
+                            "text_channel_id": ctx.channel_id,
+                        }
+                    )
                 )
+            except Exception as exc:
+                log.warning("Failed to save voice state: %s", exc)
+
+            await ctx.followup.send(f"Joined **{channel.name}**. I'm listening! 🎙️")
+
+            # Seed text channel message cache from recent history (after responding)
+            await self._seed_channel_cache(guild_id, ctx.channel_id)
+
+            await self._start_listening(guild_id, vc)
+            log.info(
+                "Joined voice channel",
+                extra={"guild_id": guild_id, "channel": channel.name},
             )
         except Exception as exc:
-            log.warning("Failed to save voice state: %s", exc)
-
-        # Seed text channel message cache from recent history
-        await self._seed_channel_cache(guild_id, ctx.channel_id)
-
-        await self._start_listening(guild_id, vc)
-        await ctx.respond(f"Joined **{channel.name}**. I'm listening! 🎙️")
-        log.info(
-            "Joined voice channel",
-            extra={"guild_id": guild_id, "channel": channel.name},
-        )
+            log.error("Failed to join voice channel: %s", exc, exc_info=True)
+            with contextlib.suppress(Exception):
+                await ctx.followup.send(f"Failed to join: {exc}", ephemeral=True)
 
     async def _cmd_leave(self, ctx: discord.ApplicationContext) -> None:
         """Handle /leave — disconnect from voice channel."""
@@ -924,19 +954,25 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
             await ctx.respond("I'm not in a voice channel.", ephemeral=True)
             return
 
-        await self._stop_listening(guild_id)
-        self._guild_text_channels.pop(guild_id, None)
-        self._guild_context.pop(guild_id, None)
-        self._channel_msg_cache.pop(guild_id, None)
-
-        # Clear persisted voice state
+        await ctx.defer()
         try:
-            _VOICE_STATE_FILE.unlink(missing_ok=True)
+            await self._stop_listening(guild_id)
+            self._guild_text_channels.pop(guild_id, None)
+            self._guild_context.pop(guild_id, None)
+            self._channel_msg_cache.pop(guild_id, None)
+
+            # Clear persisted voice state
+            try:
+                _VOICE_STATE_FILE.unlink(missing_ok=True)
+            except Exception as exc:
+                log.warning("Failed to clear voice state: %s", exc)
+            await vc.disconnect(force=True)
+            await ctx.followup.send("Disconnected. Bye! 👋")
+            log.info("Disconnected from voice channel", extra={"guild_id": guild_id})
         except Exception as exc:
-            log.warning("Failed to clear voice state: %s", exc)
-        await vc.disconnect(force=True)
-        await ctx.respond("Disconnected. Bye! 👋")
-        log.info("Disconnected from voice channel", extra={"guild_id": guild_id})
+            log.error("Failed to leave voice channel: %s", exc, exc_info=True)
+            with contextlib.suppress(Exception):
+                await ctx.followup.send(f"Failed to leave: {exc}", ephemeral=True)
 
     async def _cmd_voice(self, ctx: discord.ApplicationContext, name: str) -> None:
         """Handle /voice <name> — change TTS voice."""
@@ -1212,9 +1248,7 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
                         )
                         header = f"[Text channel #{ch_name} — last {len(ctx_lines)} messages]"
                         system_content = (
-                            session.system_prompt
-                            + f"\n\n{header}\n"
-                            + "\n".join(ctx_lines)
+                            session.system_prompt + f"\n\n{header}\n" + "\n".join(ctx_lines)
                         )
 
                 # Build message list: system prompt + full conversation history
@@ -1353,9 +1387,7 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
 
                 # Synthesise each chunk; cancel between chunks on barge-in
                 for i, chunk in enumerate(chunks):
-                    audio = await loop.run_in_executor(
-                        None, pipeline.synthesize_response, chunk
-                    )
+                    audio = await loop.run_in_executor(None, pipeline.synthesize_response, chunk)
 
                     # Check if new speech arrived during synthesis
                     if session.tts_cancel.is_set():
@@ -1366,7 +1398,9 @@ class VoiceBot(discord.Bot if _PYCORD_AVAILABLE else object):  # type: ignore[mi
                     if not audio:
                         log.warning(
                             "TTS returned empty audio for chunk %d/%d in guild %s",
-                            i + 1, len(chunks), guild_id,
+                            i + 1,
+                            len(chunks),
+                            guild_id,
                         )
                         continue
 
